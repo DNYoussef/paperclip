@@ -49,6 +49,14 @@ function blockedHostnameMessage(hostname: string): string {
   );
 }
 
+function isHealthcheckBypass(req: Request): boolean {
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    return false;
+  }
+
+  return req.path === "/api/health" || req.path === "/api/health/";
+}
+
 export function privateHostnameGuard(opts: {
   enabled: boolean;
   allowedHostnames: string[];
@@ -64,6 +72,11 @@ export function privateHostnameGuard(opts: {
   });
 
   return (req, res, next) => {
+    if (isHealthcheckBypass(req)) {
+      next();
+      return;
+    }
+
     const hostname = extractHostname(req);
     const wantsJson = req.path.startsWith("/api") || req.accepts(["json", "html", "text"]) === "json";
 

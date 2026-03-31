@@ -15,6 +15,9 @@ function createApp(opts: { enabled: boolean; allowedHostnames?: string[]; bindHo
   app.get("/api/health", (_req, res) => {
     res.status(200).json({ status: "ok" });
   });
+  app.get("/api/private", (_req, res) => {
+    res.status(200).json({ status: "ok" });
+  });
   app.get("/dashboard", (_req, res) => {
     res.status(200).send("ok");
   });
@@ -40,9 +43,15 @@ describe("privateHostnameGuard", () => {
     expect(res.status).toBe(200);
   });
 
+  it("allows health checks for unknown hostnames", async () => {
+    const app = createApp({ enabled: true, allowedHostnames: ["some-other-host"] });
+    const res = await request(app).get("/api/health").set("Host", "railway-internal:3100");
+    expect(res.status).toBe(200);
+  });
+
   it("blocks unknown hostnames with remediation command", async () => {
     const app = createApp({ enabled: true, allowedHostnames: ["some-other-host"] });
-    const res = await request(app).get("/api/health").set("Host", "dotta-macbook-pro:3100");
+    const res = await request(app).get("/api/private").set("Host", "dotta-macbook-pro:3100");
     expect(res.status).toBe(403);
     expect(res.body?.error).toContain("please run pnpm paperclipai allowed-hostname dotta-macbook-pro");
   });
