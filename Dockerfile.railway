@@ -1,0 +1,49 @@
+# Railway-specific Paperclip image.
+# This mirrors the current production runtime by building the UI and running the server via tsx.
+
+FROM node:lts-trixie-slim
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl git \
+  && rm -rf /var/lib/apt/lists/*
+RUN corepack enable
+
+WORKDIR /app
+COPY . .
+
+RUN pnpm install --frozen-lockfile
+
+# Build UI only (Vite, no TypeScript augmentation issue)
+RUN pnpm --filter @paperclipai/ui build
+
+# Build non-server packages that server depends on (shared, db, adapter-utils, adapters)
+# These don't have the Express augmentation issue
+RUN pnpm --filter @paperclipai/shared build || true
+RUN pnpm --filter @paperclipai/db build || true
+RUN pnpm --filter @paperclipai/adapter-utils build || true
+
+# Skip server tsc build -- run directly via tsx at runtime
+# mkdir dist so any path checks don't fail
+RUN mkdir -p server/dist
+
+RUN mkdir -p /paperclip && chown node:node /paperclip
+
+ENV NODE_ENV=production \
+  HOME=/paperclip \
+  HOST=0.0.0.0 \
+  PORT=3100 \
+  SERVE_UI=true \
+  PAPERCLIP_HOME=/paperclip \
+  PAPERCLIP_INSTANCE_ID=default \
+  PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
+  PAPERCLIP_DEPLOYMENT_MODE=authenticated \
+  PAPERCLIP_DEPLOYMENT_EXPOSURE=private
+
+EXPOSE 3100
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD curl -sf http://localhost:3100/health || exit 1
+
+USER node
+# Run source directly via tsx instead of compiled dist
+CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/src/index.ts"]

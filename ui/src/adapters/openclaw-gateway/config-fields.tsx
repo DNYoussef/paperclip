@@ -150,6 +150,13 @@ export function OpenClawGatewayConfigFields({
             />
           </Field>
 
+          <SecretField
+            label="Paperclip API Key"
+            value={eff("adapterConfig", "paperclipApiKey", String(config.paperclipApiKey ?? ""))}
+            onCommit={(v) => mark("adapterConfig", "paperclipApiKey", v.trim() || undefined)}
+            placeholder="pcp_..."
+          />
+
           <Field label="Session strategy">
             <select
               value={sessionStrategy}
