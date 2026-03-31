@@ -30,7 +30,11 @@ function quoteLiteral(value: string): string {
 function splitMigrationStatements(content: string): string[] {
   return content
     .split("--> statement-breakpoint")
-    .map((statement) => statement.trim())
+    .map((statement) =>
+      statement
+        .replace(/^\s*--.*$/gm, "")
+        .trim()
+    )
     .filter((statement) => statement.length > 0);
 }
 
@@ -325,6 +329,32 @@ async function columnExists(
   return rows[0]?.exists ?? false;
 }
 
+async function getColumnMetadata(
+  sql: ReturnType<typeof postgres>,
+  tableName: string,
+  columnName: string,
+): Promise<{ exists: boolean; isNullable: boolean; defaultValue: string | null }> {
+  const rows = await sql<{
+    isNullable: "YES" | "NO";
+    defaultValue: string | null;
+  }[]>`
+    SELECT
+      is_nullable AS "isNullable",
+      column_default AS "defaultValue"
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = ${tableName}
+      AND column_name = ${columnName}
+    LIMIT 1
+  `;
+  const row = rows[0];
+  return {
+    exists: Boolean(row),
+    isNullable: row?.isNullable === "YES",
+    defaultValue: row?.defaultValue ?? null,
+  };
+}
+
 async function indexExists(
   sql: ReturnType<typeof postgres>,
   indexName: string,
@@ -376,9 +406,47 @@ async function migrationStatementAlreadyApplied(
     return columnExists(sql, addColumnMatch[1], addColumnMatch[2]);
   }
 
+  const dropColumnMatch = normalized.match(
+    /^ALTER TABLE "([^"]+)" DROP COLUMN(?: IF EXISTS)? "([^"]+)"/i,
+  );
+  if (dropColumnMatch) {
+    return !(await columnExists(sql, dropColumnMatch[1], dropColumnMatch[2]));
+  }
+
+  const alterColumnSetDefaultMatch = normalized.match(
+    /^ALTER TABLE "([^"]+)" ALTER COLUMN "([^"]+)" SET DEFAULT (.+)$/i,
+  );
+  if (alterColumnSetDefaultMatch) {
+    const metadata = await getColumnMetadata(sql, alterColumnSetDefaultMatch[1], alterColumnSetDefaultMatch[2]);
+    if (!metadata.exists) return false;
+    const expectedDefault = alterColumnSetDefaultMatch[3]
+      .replace(/;$/, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/::[\w\s\[\]\."]+$/g, "");
+    const actualDefault = metadata.defaultValue
+      ?.replace(/\s+/g, " ")
+      .trim()
+      .replace(/::[\w\s\[\]\."]+$/g, "");
+    return actualDefault === expectedDefault;
+  }
+
+  const alterColumnDropNotNullMatch = normalized.match(
+    /^ALTER TABLE "([^"]+)" ALTER COLUMN "([^"]+)" DROP NOT NULL$/i,
+  );
+  if (alterColumnDropNotNullMatch) {
+    const metadata = await getColumnMetadata(sql, alterColumnDropNotNullMatch[1], alterColumnDropNotNullMatch[2]);
+    return metadata.exists && metadata.isNullable;
+  }
+
   const createIndexMatch = normalized.match(/^CREATE (?:UNIQUE )?INDEX(?: IF NOT EXISTS)? "([^"]+)"/i);
   if (createIndexMatch) {
     return indexExists(sql, createIndexMatch[1]);
+  }
+
+  const dropIndexMatch = normalized.match(/^DROP INDEX(?: IF EXISTS)? "([^"]+)"/i);
+  if (dropIndexMatch) {
+    return !(await indexExists(sql, dropIndexMatch[1]));
   }
 
   const addConstraintMatch = normalized.match(/^ALTER TABLE "([^"]+)" ADD CONSTRAINT "([^"]+)"/i);
@@ -403,6 +471,44 @@ async function migrationContentAlreadyApplied(
   }
 
   return true;
+}
+
+async function migrationFileAlreadyAppliedFromSchema(
+  sql: ReturnType<typeof postgres>,
+  migrationFile: string,
+): Promise<boolean> {
+  switch (migrationFile) {
+    case "0004_issue_identifiers.sql":
+      return (
+        await columnExists(sql, "companies", "issue_prefix")
+      ) && (
+        await columnExists(sql, "companies", "issue_counter")
+      ) && (
+        await columnExists(sql, "issues", "issue_number")
+      ) && (
+        await columnExists(sql, "issues", "identifier")
+      );
+    case "0011_windy_corsair.sql":
+      return (
+        await tableExists(sql, "project_goals")
+      ) && (
+        await indexExists(sql, "project_goals_project_idx")
+      ) && (
+        await indexExists(sql, "project_goals_goal_idx")
+      ) && (
+        await indexExists(sql, "project_goals_company_idx")
+      );
+    case "0017_tiresome_gabe_jones.sql":
+      return (
+        !(await indexExists(sql, "issues_company_identifier_idx"))
+      ) && (
+        await indexExists(sql, "companies_issue_prefix_idx")
+      ) && (
+        await indexExists(sql, "issues_identifier_idx")
+      );
+    default:
+      return false;
+  }
 }
 
 async function loadAppliedMigrations(
@@ -492,7 +598,9 @@ export async function reconcilePendingMigrationHistory(
 
     for (const migrationFile of state.pendingMigrations) {
       const migrationContent = await readMigrationFileContent(migrationFile);
-      const alreadyApplied = await migrationContentAlreadyApplied(sql, migrationContent);
+      const alreadyApplied =
+        (await migrationContentAlreadyApplied(sql, migrationContent)) ||
+        (await migrationFileAlreadyAppliedFromSchema(sql, migrationFile));
       if (!alreadyApplied) break;
 
       const hash = createHash("sha256").update(migrationContent).digest("hex");
