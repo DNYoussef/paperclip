@@ -119,6 +119,9 @@ export const localEncryptedProvider: SecretProviderModule = {
     id: "local_encrypted",
     label: "Local encrypted (default)",
     requiresExternalRef: false,
+    status: "available",
+    selectable: true,
+    evidenceStatus: "shipped_provider",
   },
   async createVersion(input) {
     const masterKey = loadOrCreateMasterKey();

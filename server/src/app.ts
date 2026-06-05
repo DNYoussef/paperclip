@@ -38,6 +38,7 @@ export async function createApp(
     deploymentMode: DeploymentMode;
     deploymentExposure: DeploymentExposure;
     allowedHostnames: string[];
+    trustedProxyHosts?: string[];
     bindHost: string;
     authReady: boolean;
     companyDeletionEnabled: boolean;
@@ -60,6 +61,7 @@ export async function createApp(
       enabled: privateHostnameGateEnabled,
       allowedHostnames: opts.allowedHostnames,
       bindHost: opts.bindHost,
+      trustedProxyHosts: opts.trustedProxyHosts ?? [],
     }),
   );
   app.use(

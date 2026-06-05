@@ -36,8 +36,14 @@ export interface CompanySecret {
   updatedAt: Date;
 }
 
+export type SecretProviderAvailability = "available" | "unavailable";
+
 export interface SecretProviderDescriptor {
   id: SecretProvider;
   label: string;
   requiresExternalRef: boolean;
+  status: SecretProviderAvailability;
+  selectable: boolean;
+  evidenceStatus: "shipped_provider" | "not_shipped_external_provider";
+  unavailableReason?: string;
 }

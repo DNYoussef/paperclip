@@ -56,15 +56,27 @@ function hashToken(token: string) {
 
 const INVITE_TOKEN_PREFIX = "pcp_invite_";
 const INVITE_TOKEN_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
-const INVITE_TOKEN_SUFFIX_LENGTH = 8;
+export const INVITE_TOKEN_SUFFIX_LENGTH = 24;
+export const INVITE_TOKEN_ENTROPY_BITS =
+  INVITE_TOKEN_SUFFIX_LENGTH * Math.log2(INVITE_TOKEN_ALPHABET.length);
+const INVITE_TOKEN_RANDOM_BYTE_LIMIT =
+  Math.floor(256 / INVITE_TOKEN_ALPHABET.length) * INVITE_TOKEN_ALPHABET.length;
 const INVITE_TOKEN_MAX_RETRIES = 5;
 const COMPANY_INVITE_TTL_MS = 10 * 60 * 1000;
 
-function createInviteToken() {
-  const bytes = randomBytes(INVITE_TOKEN_SUFFIX_LENGTH);
+function randomInviteAlphabetChar() {
+  while (true) {
+    const byte = randomBytes(1)[0]!;
+    if (byte < INVITE_TOKEN_RANDOM_BYTE_LIMIT) {
+      return INVITE_TOKEN_ALPHABET[byte % INVITE_TOKEN_ALPHABET.length]!;
+    }
+  }
+}
+
+export function createInviteToken() {
   let suffix = "";
   for (let idx = 0; idx < INVITE_TOKEN_SUFFIX_LENGTH; idx += 1) {
-    suffix += INVITE_TOKEN_ALPHABET[bytes[idx]! % INVITE_TOKEN_ALPHABET.length];
+    suffix += randomInviteAlphabetChar();
   }
   return `${INVITE_TOKEN_PREFIX}${suffix}`;
 }
@@ -1360,83 +1372,6 @@ function isInviteTokenHashCollisionError(error: unknown) {
   return false;
 }
 
-function isAbortError(error: unknown) {
-  return error instanceof Error && error.name === "AbortError";
-}
-
-type InviteResolutionProbe = {
-  status: "reachable" | "timeout" | "unreachable";
-  method: "HEAD";
-  durationMs: number;
-  httpStatus: number | null;
-  message: string;
-};
-
-async function probeInviteResolutionTarget(
-  url: URL,
-  timeoutMs: number
-): Promise<InviteResolutionProbe> {
-  const startedAt = Date.now();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, {
-      method: "HEAD",
-      redirect: "manual",
-      signal: controller.signal
-    });
-    const durationMs = Date.now() - startedAt;
-    if (
-      response.ok ||
-      response.status === 401 ||
-      response.status === 403 ||
-      response.status === 404 ||
-      response.status === 405 ||
-      response.status === 422 ||
-      response.status === 500 ||
-      response.status === 501
-    ) {
-      return {
-        status: "reachable",
-        method: "HEAD",
-        durationMs,
-        httpStatus: response.status,
-        message: `Webhook endpoint responded to HEAD with HTTP ${response.status}.`
-      };
-    }
-    return {
-      status: "unreachable",
-      method: "HEAD",
-      durationMs,
-      httpStatus: response.status,
-      message: `Webhook endpoint probe returned HTTP ${response.status}.`
-    };
-  } catch (error) {
-    const durationMs = Date.now() - startedAt;
-    if (isAbortError(error)) {
-      return {
-        status: "timeout",
-        method: "HEAD",
-        durationMs,
-        httpStatus: null,
-        message: `Webhook endpoint probe timed out after ${timeoutMs}ms.`
-      };
-    }
-    return {
-      status: "unreachable",
-      method: "HEAD",
-      durationMs,
-      httpStatus: null,
-      message:
-        error instanceof Error
-          ? error.message
-          : "Webhook endpoint probe failed."
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 export function accessRoutes(
   db: Db,
   opts: {
@@ -1779,33 +1714,8 @@ export function accessRoutes(
       throw notFound("Invite not found");
     }
 
-    const rawUrl =
-      typeof req.query.url === "string" ? req.query.url.trim() : "";
-    if (!rawUrl) throw badRequest("url query parameter is required");
-    let target: URL;
-    try {
-      target = new URL(rawUrl);
-    } catch {
-      throw badRequest("url must be an absolute http(s) URL");
-    }
-    if (target.protocol !== "http:" && target.protocol !== "https:") {
-      throw badRequest("url must use http or https");
-    }
-
-    const parsedTimeoutMs =
-      typeof req.query.timeoutMs === "string"
-        ? Number(req.query.timeoutMs)
-        : NaN;
-    const timeoutMs = Number.isFinite(parsedTimeoutMs)
-      ? Math.max(1000, Math.min(15000, Math.floor(parsedTimeoutMs)))
-      : 5000;
-    const probe = await probeInviteResolutionTarget(target, timeoutMs);
-    res.json({
-      inviteId: invite.id,
-      testResolutionPath: `/api/invites/${token}/test-resolution`,
-      requestedUrl: target.toString(),
-      timeoutMs,
-      ...probe
+    res.status(410).json({
+      error: "Invite resolution probing is disabled."
     });
   });
 

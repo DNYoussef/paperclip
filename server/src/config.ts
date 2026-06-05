@@ -35,6 +35,7 @@ export interface Config {
   host: string;
   port: number;
   allowedHostnames: string[];
+  trustedProxyHosts: string[];
   authBaseUrlMode: AuthBaseUrlMode;
   authPublicBaseUrl: string | undefined;
   authDisableSignUp: boolean;
@@ -174,6 +175,10 @@ export function loadConfig(): Config {
         .filter(Boolean),
     ),
   );
+  const trustedProxyHosts = (process.env.PAPERCLIP_TRUSTED_PROXY_HOSTS ?? "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => value.length > 0);
   const companyDeletionEnvRaw = process.env.PAPERCLIP_ENABLE_COMPANY_DELETION;
   const companyDeletionEnabled =
     companyDeletionEnvRaw !== undefined
@@ -207,6 +212,7 @@ export function loadConfig(): Config {
     host: process.env.HOST ?? fileConfig?.server.host ?? "127.0.0.1",
     port: Number(process.env.PORT) || fileConfig?.server.port || 3100,
     allowedHostnames,
+    trustedProxyHosts,
     authBaseUrlMode,
     authPublicBaseUrl,
     authDisableSignUp,

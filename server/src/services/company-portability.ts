@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type {
@@ -148,10 +149,84 @@ function normalizeInclude(input?: Partial<CompanyPortabilityInclude>): CompanyPo
 
 function ensureMarkdownPath(pathValue: string) {
   const normalized = pathValue.replace(/\\/g, "/");
+  if (/^[a-z][a-z0-9+.-]*:/i.test(normalized) || normalized.startsWith("/") || normalized.split("/").includes("..")) {
+    throw unprocessable(`Manifest file path must be a relative markdown path: ${pathValue}`);
+  }
   if (!normalized.endsWith(".md")) {
     throw unprocessable(`Manifest file path must end in .md: ${pathValue}`);
   }
   return normalized;
+}
+
+function normalizeRemoteHostname(hostname: string) {
+  return hostname.trim().toLowerCase().replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "");
+}
+
+function isPrivateIpv4(hostname: string) {
+  const parts = hostname.split(".").map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return false;
+  }
+  const [a, b] = parts as [number, number, number, number];
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    a >= 224
+  );
+}
+
+function isPrivateIpv6(hostname: string) {
+  const normalized = hostname.toLowerCase();
+  if (normalized.startsWith("::ffff:")) {
+    return isPrivateIpv4(normalized.slice("::ffff:".length));
+  }
+  return (
+    normalized === "::" ||
+    normalized === "::1" ||
+    normalized.startsWith("fc") ||
+    normalized.startsWith("fd") ||
+    normalized.startsWith("fe80:")
+  );
+}
+
+function isBlockedRemoteHostname(hostname: string) {
+  const normalized = normalizeRemoteHostname(hostname);
+  if (!normalized) return true;
+  if (
+    normalized === "localhost" ||
+    normalized.endsWith(".localhost") ||
+    normalized.endsWith(".local") ||
+    normalized.endsWith(".internal") ||
+    normalized === "metadata.google.internal"
+  ) {
+    return true;
+  }
+  const ipVersion = net.isIP(normalized);
+  if (ipVersion === 4) return isPrivateIpv4(normalized);
+  if (ipVersion === 6) return isPrivateIpv6(normalized);
+  return false;
+}
+
+function validateRemoteFetchUrl(rawUrl: string) {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw unprocessable("Remote import URL is invalid");
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw unprocessable("Remote import URL must use http or https");
+  }
+  if (isBlockedRemoteHostname(parsed.hostname)) {
+    throw unprocessable(`Remote import URL host is not allowed: ${parsed.hostname}`);
+  }
+  return parsed.toString();
 }
 
 function normalizePortableEnv(
@@ -381,17 +456,19 @@ function parseFrontmatterMarkdown(raw: string): MarkdownDoc {
 }
 
 async function fetchJson(url: string) {
-  const response = await fetch(url);
+  const safeUrl = validateRemoteFetchUrl(url);
+  const response = await fetch(safeUrl);
   if (!response.ok) {
-    throw unprocessable(`Failed to fetch ${url}: ${response.status}`);
+    throw unprocessable(`Failed to fetch ${safeUrl}: ${response.status}`);
   }
   return response.json();
 }
 
 async function fetchText(url: string) {
-  const response = await fetch(url);
+  const safeUrl = validateRemoteFetchUrl(url);
+  const response = await fetch(safeUrl);
   if (!response.ok) {
-    throw unprocessable(`Failed to fetch ${url}: ${response.status}`);
+    throw unprocessable(`Failed to fetch ${safeUrl}: ${response.status}`);
   }
   return response.text();
 }

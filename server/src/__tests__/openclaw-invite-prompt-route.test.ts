@@ -56,6 +56,32 @@ function createDbStub() {
   };
 }
 
+function createInviteLookupDb() {
+  const invite = {
+    id: "invite-1",
+    companyId: "company-1",
+    inviteType: "company_join",
+    allowedJoinTypes: "agent",
+    defaultsPayload: null,
+    expiresAt: new Date("2099-03-07T00:10:00.000Z"),
+    invitedByUserId: null,
+    tokenHash: "hash",
+    revokedAt: null,
+    acceptedAt: null,
+    createdAt: new Date("2026-03-07T00:00:00.000Z"),
+    updatedAt: new Date("2026-03-07T00:00:00.000Z"),
+  };
+  return {
+    select: vi.fn().mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          then: (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([invite])),
+        }),
+      }),
+    }),
+  };
+}
+
 function createApp(actor: Record<string, unknown>, db: Record<string, unknown>) {
   const app = express();
   app.use(express.json());
@@ -177,5 +203,23 @@ describe("POST /companies/:companyId/openclaw/invite-prompt", () => {
 
     expect(res.status).toBe(403);
     expect(res.body.error).toBe("Permission denied");
+  });
+});
+
+describe("GET /invites/:token/test-resolution", () => {
+  it("does not fetch caller-supplied URLs", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("fetch should not be called"));
+    const app = createApp({ type: "anonymous" }, createInviteLookupDb());
+
+    const res = await request(app)
+      .get("/api/invites/pcp_invite_test/test-resolution")
+      .query({ url: "http://169.254.169.254/latest/meta-data" });
+
+    expect(res.status).toBe(410);
+    expect(res.body.error).toContain("disabled");
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
   });
 });

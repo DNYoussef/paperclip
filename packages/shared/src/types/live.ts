@@ -1,7 +1,7 @@
 import type { LiveEventType } from "../constants.js";
 
 export interface LiveEvent {
-  id: number;
+  id: string;
   companyId: string;
   type: LiveEventType;
   createdAt: string;

@@ -3,13 +3,19 @@ import express from "express";
 import request from "supertest";
 import { privateHostnameGuard } from "../middleware/private-hostname-guard.js";
 
-function createApp(opts: { enabled: boolean; allowedHostnames?: string[]; bindHost?: string }) {
+function createApp(opts: {
+  enabled: boolean;
+  allowedHostnames?: string[];
+  bindHost?: string;
+  trustedProxyHosts?: string[];
+}) {
   const app = express();
   app.use(
     privateHostnameGuard({
       enabled: opts.enabled,
       allowedHostnames: opts.allowedHostnames ?? [],
       bindHost: opts.bindHost ?? "0.0.0.0",
+      trustedProxyHosts: opts.trustedProxyHosts ?? [],
     }),
   );
   app.get("/api/health", (_req, res) => {
@@ -62,4 +68,29 @@ describe("privateHostnameGuard", () => {
     expect(res.status).toBe(403);
     expect(res.text).toContain("please run pnpm paperclipai allowed-hostname dotta-macbook-pro");
   }, 20_000);
+
+  it("does not trust spoofed forwarded host from an untrusted peer", async () => {
+    const app = createApp({ enabled: true, allowedHostnames: ["allowed.example"] });
+    const res = await request(app)
+      .get("/api/private")
+      .set("Host", "attacker.example")
+      .set("X-Forwarded-Host", "allowed.example");
+
+    expect(res.status).toBe(403);
+    expect(res.body?.error).toContain("attacker.example");
+  });
+
+  it("honors forwarded host only from a declared trusted proxy", async () => {
+    const app = createApp({
+      enabled: true,
+      allowedHostnames: ["allowed.example"],
+      trustedProxyHosts: ["127.0.0.1", "::1", "::ffff:127.0.0.1"],
+    });
+    const res = await request(app)
+      .get("/api/private")
+      .set("Host", "attacker.example")
+      .set("X-Forwarded-Host", "allowed.example");
+
+    expect(res.status).toBe(200);
+  });
 });

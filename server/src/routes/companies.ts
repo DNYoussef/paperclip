@@ -63,6 +63,7 @@ export function companyRoutes(db: Db) {
   });
 
   router.post("/:companyId/export", validate(companyPortabilityExportSchema), async (req, res) => {
+    assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const result = await portability.exportBundle(companyId, req.body);
@@ -70,20 +71,18 @@ export function companyRoutes(db: Db) {
   });
 
   router.post("/import/preview", validate(companyPortabilityPreviewSchema), async (req, res) => {
+    assertBoard(req);
     if (req.body.target.mode === "existing_company") {
       assertCompanyAccess(req, req.body.target.companyId);
-    } else {
-      assertBoard(req);
     }
     const preview = await portability.previewImport(req.body);
     res.json(preview);
   });
 
   router.post("/import", validate(companyPortabilityImportSchema), async (req, res) => {
+    assertBoard(req);
     if (req.body.target.mode === "existing_company") {
       assertCompanyAccess(req, req.body.target.companyId);
-    } else {
-      assertBoard(req);
     }
     const actor = getActorInfo(req);
     const result = await portability.importBundle(req.body, req.actor.type === "board" ? req.actor.userId : null);

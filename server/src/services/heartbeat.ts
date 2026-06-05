@@ -106,6 +106,49 @@ async function withAgentStartLock<T>(agentId: string, fn: () => Promise<T>) {
   }
 }
 
+type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
+type AgentRow = typeof agents.$inferSelect;
+
+export async function claimQueuedHeartbeatRunForCapacity(input: {
+  db: Db;
+  run: HeartbeatRunRow;
+  claimedAt?: Date;
+  maxConcurrentRunsForAgent: (agent: AgentRow) => number;
+}) {
+  const { db, run, maxConcurrentRunsForAgent } = input;
+  if (run.status !== "queued") return run;
+
+  const claimedAt = input.claimedAt ?? new Date();
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select id from agents where id = ${run.agentId} for update`);
+
+    const agent = await tx
+      .select()
+      .from(agents)
+      .where(eq(agents.id, run.agentId))
+      .then((rows) => rows[0] ?? null);
+    if (!agent) return null;
+
+    const maxConcurrentRuns = maxConcurrentRunsForAgent(agent);
+    const [{ count }] = await tx
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "running")));
+    if (Number(count ?? 0) >= maxConcurrentRuns) return null;
+
+    return tx
+      .update(heartbeatRuns)
+      .set({
+        status: "running",
+        startedAt: run.startedAt ?? claimedAt,
+        updatedAt: claimedAt,
+      })
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+  });
+}
+
 interface WakeupOptions {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -455,6 +498,7 @@ export function heartbeatService(db: Db) {
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
   const issuesSvc = issueService(db);
+  const costsSvc = costService(db);
   const activeRunExecutions = new Set<string>();
 
   async function getAgent(agentId: string) {
@@ -858,6 +902,60 @@ export function heartbeatService(db: Db) {
     };
   }
 
+  async function budgetExhaustionForAgent(agent: typeof agents.$inferSelect) {
+    const state = await costsSvc.budgetStateForAgent(agent.companyId, agent.id);
+    if (state.companyBudgetExhausted) {
+      return {
+        message: "Company monthly budget exhausted",
+        errorCode: "company_budget_exhausted",
+      };
+    }
+    if (state.agentBudgetExhausted) {
+      return {
+        message: "Agent monthly budget exhausted",
+        errorCode: "budget_exhausted",
+      };
+    }
+    return null;
+  }
+
+  function effectiveMaxConcurrentRuns(
+    agent: typeof agents.$inferSelect,
+    policy: ReturnType<typeof parseHeartbeatPolicy>,
+  ) {
+    return agent.budgetMonthlyCents > 0 ? 1 : policy.maxConcurrentRuns;
+  }
+
+  async function pauseAgentForBudget(agent: typeof agents.$inferSelect) {
+    if (agent.status === "paused" || agent.status === "terminated") return;
+    const updated = await db
+      .update(agents)
+      .set({ status: "paused", updatedAt: new Date() })
+      .where(
+        and(
+          eq(agents.id, agent.id),
+          sql`${agents.status} not in ('paused', 'terminated')`,
+        ),
+      )
+      .returning()
+      .then((rows) => rows[0] ?? null);
+
+    if (updated) {
+      publishLiveEvent({
+        companyId: updated.companyId,
+        type: "agent.status",
+        payload: {
+          agentId: updated.id,
+          status: updated.status,
+          lastHeartbeatAt: updated.lastHeartbeatAt
+            ? new Date(updated.lastHeartbeatAt).toISOString()
+            : null,
+          reason: "budget_exhausted",
+        },
+      });
+    }
+  }
+
   async function countRunningRunsForAgent(agentId: string) {
     const [{ count }] = await db
       .select({ count: sql<number>`count(*)` })
@@ -869,16 +967,14 @@ export function heartbeatService(db: Db) {
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect) {
     if (run.status !== "queued") return run;
     const claimedAt = new Date();
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const claimed = await claimQueuedHeartbeatRunForCapacity({
+      db,
+      run,
+      claimedAt,
+      maxConcurrentRunsForAgent(agent) {
+        return effectiveMaxConcurrentRuns(agent, parseHeartbeatPolicy(agent));
+      },
+    });
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -1042,8 +1138,7 @@ export function heartbeatService(db: Db) {
       .where(eq(agentRuntimeState.agentId, agent.id));
 
     if (additionalCostCents > 0 || hasTokenUsage) {
-      const costs = costService(db);
-      await costs.createEvent(agent.companyId, {
+      await costsSvc.createEvent(agent.companyId, {
         agentId: agent.id,
         provider: result.provider ?? "unknown",
         model: result.model ?? "unknown",
@@ -1060,8 +1155,14 @@ export function heartbeatService(db: Db) {
       const agent = await getAgent(agentId);
       if (!agent) return [];
       const policy = parseHeartbeatPolicy(agent);
+      const budgetBlock = await budgetExhaustionForAgent(agent);
+      if (budgetBlock) {
+        await pauseAgentForBudget(agent);
+        return [];
+      }
       const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+      const maxConcurrentRuns = effectiveMaxConcurrentRuns(agent, policy);
+      const availableSlots = Math.max(0, maxConcurrentRuns - runningCount);
       if (availableSlots <= 0) return [];
 
       const queuedRuns = await db
@@ -1117,6 +1218,22 @@ export function heartbeatService(db: Db) {
         error: "Agent not found",
       });
       const failedRun = await getRun(runId);
+      if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
+      return;
+    }
+
+    const budgetBlock = await budgetExhaustionForAgent(agent);
+    if (budgetBlock) {
+      const failedRun = await setRunStatus(runId, "failed", {
+        error: budgetBlock.message,
+        errorCode: budgetBlock.errorCode,
+        finishedAt: new Date(),
+      });
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: new Date(),
+        error: budgetBlock.message,
+      });
+      await pauseAgentForBudget(agent);
       if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
       return;
     }
