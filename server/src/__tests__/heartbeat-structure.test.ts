@@ -21,30 +21,42 @@ describe("heartbeat service structure", () => {
     const heartbeatSource = readService("heartbeat.ts");
     const capacitySource = readService("heartbeat-capacity.ts");
     const sessionSource = readService("heartbeat-session.ts");
+    const executionSource = readService("heartbeat-execution.ts");
 
-    expect(heartbeatSource.split(/\r?\n/).length).toBeLessThan(2400);
+    expect(heartbeatSource.split(/\r?\n/).length).toBeLessThan(2050);
     expect(heartbeatSource).toContain('from "./heartbeat-capacity.js"');
     expect(heartbeatSource).toContain('from "./heartbeat-session.js"');
+    expect(heartbeatSource).toContain('from "./heartbeat-execution.js"');
     expect(heartbeatSource).not.toContain("const defaultSessionCodec");
     expect(heartbeatSource).not.toContain("select id from agents where id");
     expect(heartbeatSource).not.toContain("function mergeCoalescedContextSnapshot");
+    expect(heartbeatSource).not.toContain("handle = await runLogStore.begin");
+    expect(heartbeatSource).not.toContain("getServerAdapter(agent.adapterType)");
+    expect(heartbeatSource).not.toContain("persistAdapterManagedRuntimeServices");
     expect(capacitySource).toContain("select id from agents where id");
     expect(capacitySource).toContain("export async function claimQueuedHeartbeatRunForCapacity");
     expect(sessionSource).toContain("export function mergeCoalescedContextSnapshot");
     expect(sessionSource).toContain("export function resolveNextSessionState");
+    expect(executionSource).toContain("export async function runPreparedAdapterExecution");
+    expect(executionSource).toContain("handle = await runLogStore.begin");
+    expect(executionSource).toContain("getServerAdapter(agent.adapterType)");
+    expect(executionSource).toContain("persistAdapterManagedRuntimeServices");
   });
 
-  it("keeps executeRun as an orchestrator with extracted setup", () => {
+  it("keeps executeRun as an orchestrator with extracted setup and execution", () => {
     const heartbeatSource = readService("heartbeat.ts");
 
     expect(heartbeatSource).toContain("async function prepareExecutionContextForRun");
     expect(heartbeatSource).toContain("prepareExecutionContextForRun(run, agent)");
+    expect(heartbeatSource).toContain("runPreparedAdapterExecution({");
+    expect(heartbeatSource).not.toContain("let stdoutExcerpt");
+    expect(heartbeatSource).not.toContain("const onAdapterMeta");
     expect(
       functionSpanLines(
         heartbeatSource,
         "  async function executeRun(runId: string)",
         "  async function releaseIssueExecutionAndPromote",
       ),
-    ).toBeLessThan(540);
+    ).toBeLessThan(140);
   });
 });
