@@ -1,0 +1,7 @@
+{
+  "analyzer": "god_object",
+  "path": "D:\\Projects\\paperclip",
+  "success": true,
+  "threshold": 15,
+  "violations": []
+}
