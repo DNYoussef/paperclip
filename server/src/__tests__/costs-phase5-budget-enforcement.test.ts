@@ -78,10 +78,13 @@ function createBudgetDb(opts: {
     select: vi.fn((_selection?: Record<string, unknown>) => ({
       from: vi.fn((table: unknown) => ({
         where: vi.fn(() => {
-          if (table === agents) return thenableRows([agent]);
-          if (table === companies) return thenableRows([company]);
-          if (table === costEvents) return thenableRows([{ total: totals.shift() ?? 0 }]);
-          return thenableRows([]);
+          let rows;
+          if (table === agents) rows = thenableRows([agent]);
+          else if (table === companies) rows = thenableRows([company]);
+          else if (table === costEvents) rows = thenableRows([{ total: totals.shift() ?? 0 }]);
+          else rows = thenableRows([]);
+          // .for("update") is a row lock in real Postgres; the mock ignores it.
+          return Object.assign(rows, { for: vi.fn(() => rows) });
         }),
       })),
     })),
@@ -101,6 +104,9 @@ function createBudgetDb(opts: {
         };
       }),
     })),
+    // createEvent now recomputes/pauses inside one transaction; the mock runs the
+    // callback against itself (single connection, no real isolation needed here).
+    transaction: async (cb: (tx: unknown) => unknown) => cb(db),
   };
 
   return { db: db as unknown as Db, updates, insertedValues };

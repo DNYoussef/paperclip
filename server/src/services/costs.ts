@@ -15,9 +15,9 @@ export function budgetMonthWindow(asOf: Date) {
 }
 
 export function costService(db: Db) {
-  async function monthlyAgentSpendCents(companyId: string, agentId: string, asOf: Date) {
+  async function monthlyAgentSpendCents(companyId: string, agentId: string, asOf: Date, conn: Db = db) {
     const { from, to } = budgetMonthWindow(asOf);
-    const [{ total }] = await db
+    const [{ total }] = await conn
       .select({
         total: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::int`,
       })
@@ -34,9 +34,9 @@ export function costService(db: Db) {
     return Number(total ?? 0);
   }
 
-  async function monthlyCompanySpendCents(companyId: string, asOf: Date) {
+  async function monthlyCompanySpendCents(companyId: string, asOf: Date, conn: Db = db) {
     const { from, to } = budgetMonthWindow(asOf);
-    const [{ total }] = await db
+    const [{ total }] = await conn
       .select({
         total: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::int`,
       })
@@ -52,8 +52,8 @@ export function costService(db: Db) {
     return Number(total ?? 0);
   }
 
-  async function budgetStateForAgent(companyId: string, agentId: string, asOf = new Date()) {
-    const agent = await db
+  async function budgetStateForAgent(companyId: string, agentId: string, asOf = new Date(), conn: Db = db) {
+    const agent = await conn
       .select()
       .from(agents)
       .where(eq(agents.id, agentId))
@@ -64,7 +64,7 @@ export function costService(db: Db) {
       throw unprocessable("Agent does not belong to company");
     }
 
-    const company = await db
+    const company = await conn
       .select()
       .from(companies)
       .where(eq(companies.id, companyId))
@@ -72,8 +72,8 @@ export function costService(db: Db) {
 
     if (!company) throw notFound("Company not found");
 
-    const agentSpendCents = await monthlyAgentSpendCents(companyId, agentId, asOf);
-    const companySpendCents = await monthlyCompanySpendCents(companyId, asOf);
+    const agentSpendCents = await monthlyAgentSpendCents(companyId, agentId, asOf, conn);
+    const companySpendCents = await monthlyCompanySpendCents(companyId, asOf, conn);
 
     return {
       agentId,
@@ -103,54 +103,62 @@ export function costService(db: Db) {
         throw unprocessable("Agent does not belong to company");
       }
 
-      const event = await db
-        .insert(costEvents)
-        .values({ ...data, companyId })
-        .returning()
-        .then((rows) => rows[0]);
+      // Recompute-and-pause is a read-modify-write on the spend caches; run it in
+      // ONE transaction (and lock the agent row) so concurrent cost events cannot
+      // interleave and under-report spend before the pause fires.
+      return db.transaction(async (tx) => {
+        const event = await tx
+          .insert(costEvents)
+          .values({ ...data, companyId })
+          .returning()
+          .then((rows) => rows[0]);
 
-      const budgetState = await budgetStateForAgent(companyId, event.agentId, event.occurredAt);
+        // Serialize per agent for the duration of the recompute.
+        await tx.select().from(agents).where(eq(agents.id, event.agentId)).for("update");
 
-      await db
-        .update(agents)
-        .set({
-          spentMonthlyCents: budgetState.agentSpendCents,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, event.agentId));
+        const budgetState = await budgetStateForAgent(companyId, event.agentId, event.occurredAt, tx);
 
-      await db
-        .update(companies)
-        .set({
-          spentMonthlyCents: budgetState.companySpendCents,
-          updatedAt: new Date(),
-        })
-        .where(eq(companies.id, companyId));
-
-      if (
-        budgetState.agentBudgetExhausted &&
-        agent.status !== "paused" &&
-        agent.status !== "terminated"
-      ) {
-        await db
+        await tx
           .update(agents)
-          .set({ status: "paused", updatedAt: new Date() })
-          .where(eq(agents.id, agent.id));
-      }
+          .set({
+            spentMonthlyCents: budgetState.agentSpendCents,
+            updatedAt: new Date(),
+          })
+          .where(eq(agents.id, event.agentId));
 
-      if (budgetState.companyBudgetExhausted) {
-        await db
-          .update(agents)
-          .set({ status: "paused", updatedAt: new Date() })
-          .where(
-            and(
-              eq(agents.companyId, companyId),
-              sql`${agents.status} not in ('paused', 'terminated')`,
-            ),
-          );
-      }
+        await tx
+          .update(companies)
+          .set({
+            spentMonthlyCents: budgetState.companySpendCents,
+            updatedAt: new Date(),
+          })
+          .where(eq(companies.id, companyId));
 
-      return event;
+        if (
+          budgetState.agentBudgetExhausted &&
+          agent.status !== "paused" &&
+          agent.status !== "terminated"
+        ) {
+          await tx
+            .update(agents)
+            .set({ status: "paused", updatedAt: new Date() })
+            .where(eq(agents.id, agent.id));
+        }
+
+        if (budgetState.companyBudgetExhausted) {
+          await tx
+            .update(agents)
+            .set({ status: "paused", updatedAt: new Date() })
+            .where(
+              and(
+                eq(agents.companyId, companyId),
+                sql`${agents.status} not in ('paused', 'terminated')`,
+              ),
+            );
+        }
+
+        return event;
+      });
     },
 
     summary: async (companyId: string, range?: CostDateRange) => {
