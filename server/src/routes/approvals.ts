@@ -1,5 +1,6 @@
-import { Router } from "express";
+import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
+import { notFound } from "../errors.js";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
@@ -118,14 +119,21 @@ export function approvalRoutes(db: Db) {
     res.json(issues);
   });
 
-  router.post("/approvals/:id/approve", validate(resolveApprovalSchema), async (req, res) => {
+  // SEC-056/SEC-058: decisions are board-only, scoped to the approval's
+  // company, and attributed to the authenticated user.
+  async function loadApprovalForDecision(req: Request, id: string) {
+    getActorInfo(req);
+    const approval = await svc.getById(id);
+    if (!approval) throw notFound("Approval not found");
+    assertCompanyAccess(req, approval.companyId);
     assertBoard(req);
+    return req.actor.userId ?? "board";
+  }
+
+  router.post("/approvals/:id/approve", validate(resolveApprovalSchema), async (req, res) => {
     const id = req.params.id as string;
-    const { approval, applied } = await svc.approve(
-      id,
-      req.body.decidedByUserId ?? "board",
-      req.body.decisionNote,
-    );
+    const decidedByUserId = await loadApprovalForDecision(req, id);
+    const { approval, applied } = await svc.approve(id, decidedByUserId, req.body.decisionNote);
 
     if (applied) {
       const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
@@ -214,13 +222,9 @@ export function approvalRoutes(db: Db) {
   });
 
   router.post("/approvals/:id/reject", validate(resolveApprovalSchema), async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
-    const { approval, applied } = await svc.reject(
-      id,
-      req.body.decidedByUserId ?? "board",
-      req.body.decisionNote,
-    );
+    const decidedByUserId = await loadApprovalForDecision(req, id);
+    const { approval, applied } = await svc.reject(id, decidedByUserId, req.body.decisionNote);
 
     if (applied) {
       await logActivity(db, {
@@ -241,13 +245,9 @@ export function approvalRoutes(db: Db) {
     "/approvals/:id/request-revision",
     validate(requestApprovalRevisionSchema),
     async (req, res) => {
-      assertBoard(req);
       const id = req.params.id as string;
-      const approval = await svc.requestRevision(
-        id,
-        req.body.decidedByUserId ?? "board",
-        req.body.decisionNote,
-      );
+      const decidedByUserId = await loadApprovalForDecision(req, id);
+      const approval = await svc.requestRevision(id, decidedByUserId, req.body.decisionNote);
 
       await logActivity(db, {
         companyId: approval.companyId,

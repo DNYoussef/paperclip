@@ -63,6 +63,7 @@ describe("approval routes idempotent retries", () => {
     mockHeartbeatService.wakeup.mockResolvedValue({ id: "wake-1" });
     mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: "issue-1" }]);
     mockLogActivity.mockResolvedValue(undefined);
+    mockApprovalService.getById.mockResolvedValue({ id: "approval-1", companyId: "company-1" });
   });
 
   it("does not emit duplicate approval side effects when approve is already resolved", async () => {
