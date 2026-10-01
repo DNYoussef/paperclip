@@ -8,7 +8,15 @@ import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipa
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
-import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import {
+  registerLiveEventsConnection,
+  subscribeCompanyLiveEvents,
+  type LiveEventsConnectionContext,
+} from "../services/live-events.js";
+
+// SEC-060: a socket is re-authorized only at upgrade time, so its lifetime is
+// bounded; the UI reconnects on close and re-runs the upgrade authorization.
+export const LIVE_EVENTS_MAX_CONNECTION_MS = 60 * 60 * 1000;
 
 interface WsSocket {
   readyState: number;
@@ -40,11 +48,7 @@ const { WebSocket, WebSocketServer } = require("ws") as {
   WebSocketServer: new (opts: { noServer: boolean }) => WsServer;
 };
 
-interface UpgradeContext {
-  companyId: string;
-  actorType: "board" | "agent";
-  actorId: string;
-}
+type UpgradeContext = LiveEventsConnectionContext;
 
 interface IncomingMessageWithContext extends IncomingMessage {
   paperclipUpgradeContext?: UpgradeContext;
@@ -123,6 +127,7 @@ async function authorizeUpgrade(
     const session = await opts.resolveSessionFromHeaders(headersFromIncomingMessage(req));
     const userId = session?.user?.id;
     if (!userId) return null;
+    const sessionId = session?.session?.id;
 
     const [roleRow, memberships] = await Promise.all([
       db
@@ -149,6 +154,8 @@ async function authorizeUpgrade(
       companyId,
       actorType: "board",
       actorId: userId,
+      userId,
+      sessionId,
     };
   }
 
@@ -172,6 +179,8 @@ async function authorizeUpgrade(
     companyId,
     actorType: "agent",
     actorId: key.agentId,
+    agentId: key.agentId,
+    keyId: key.id,
   };
 }
 
@@ -186,9 +195,17 @@ export function setupLiveEventsWebSocketServer(
   const wss = new WebSocketServer({ noServer: true });
   const cleanupByClient = new Map<WsSocket, () => void>();
   const aliveByClient = new Map<WsSocket, boolean>();
+  const connectedAtByClient = new Map<WsSocket, number>();
 
   const pingInterval = setInterval(() => {
+    const now = Date.now();
     for (const socket of wss.clients) {
+      const connectedAt = connectedAtByClient.get(socket);
+      if (connectedAt !== undefined && now - connectedAt > LIVE_EVENTS_MAX_CONNECTION_MS) {
+        cleanupByClient.get(socket)?.();
+        socket.close(1008, "connection lifetime exceeded; reconnect");
+        continue;
+      }
       if (!aliveByClient.get(socket)) {
         socket.terminate();
         continue;
@@ -210,19 +227,27 @@ export function setupLiveEventsWebSocketServer(
       socket.send(JSON.stringify(event));
     });
 
-    cleanupByClient.set(socket, unsubscribe);
+    const cleanup = () => {
+      unsubscribe();
+      unregister();
+      cleanupByClient.delete(socket);
+      aliveByClient.delete(socket);
+      connectedAtByClient.delete(socket);
+    };
+    const unregister = registerLiveEventsConnection(context, (code, reason) => {
+      cleanup();
+      socket.close(code, reason);
+    });
+
+    cleanupByClient.set(socket, cleanup);
     aliveByClient.set(socket, true);
+    connectedAtByClient.set(socket, Date.now());
 
     socket.on("pong", () => {
       aliveByClient.set(socket, true);
     });
 
-    socket.on("close", () => {
-      const cleanup = cleanupByClient.get(socket);
-      if (cleanup) cleanup();
-      cleanupByClient.delete(socket);
-      aliveByClient.delete(socket);
-    });
+    socket.on("close", cleanup);
 
     socket.on("error", (err: Error) => {
       logger.warn({ err, companyId: context.companyId }, "live websocket client error");

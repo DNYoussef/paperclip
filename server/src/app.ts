@@ -25,6 +25,7 @@ import { llmRoutes } from "./routes/llms.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { applyUiBranding } from "./ui-branding.js";
+import { closeLiveEventsConnections } from "./services/live-events.js";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 
 type UiMode = "none" | "static" | "vite-dev";
@@ -86,6 +87,18 @@ export async function createApp(
     });
   });
   if (opts.betterAuthHandler) {
+    // SEC-060: a sign-out must also close that session's live-events sockets.
+    app.post("/api/auth/sign-out", async (req, res, next) => {
+      const sessionId = req.actor.type === "board" && opts.resolveSession
+        ? await opts.resolveSession(req).then((s) => s?.session?.id ?? null).catch(() => null)
+        : null;
+      if (sessionId) {
+        res.on("finish", () => {
+          closeLiveEventsConnections({ sessionId }, "logout");
+        });
+      }
+      next();
+    });
     app.all("/api/auth/*authPath", opts.betterAuthHandler);
   }
   app.use(llmRoutes(db));

@@ -6,6 +6,7 @@ import {
   principalPermissionGrants,
 } from "@paperclipai/db";
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
+import { closeLiveEventsConnections } from "./live-events.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
 type GrantInput = {
@@ -163,8 +164,9 @@ export function accessService(db: Db) {
     const existingByCompany = new Map(existing.map((row) => [row.companyId, row]));
     const target = new Set(companyIds);
 
+    const removed = existing.filter((row) => !target.has(row.companyId));
     await db.transaction(async (tx) => {
-      const toDelete = existing.filter((row) => !target.has(row.companyId)).map((row) => row.id);
+      const toDelete = removed.map((row) => row.id);
       if (toDelete.length > 0) {
         await tx.delete(companyMemberships).where(inArray(companyMemberships.id, toDelete));
       }
@@ -180,6 +182,11 @@ export function accessService(db: Db) {
         });
       }
     });
+
+    // SEC-060: a removed member must not keep a live-events stream open.
+    for (const row of removed) {
+      closeLiveEventsConnections({ userId, companyId: row.companyId }, "membership removed");
+    }
 
     return listUserCompanyAccess(userId);
   }
