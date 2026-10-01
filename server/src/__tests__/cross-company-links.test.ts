@@ -438,3 +438,53 @@ describe("run links stay inside the issue company (SEC-056)", () => {
     expect(await runStatus(w.runA.id)).toBe("cancelled");
   });
 });
+
+describe("workspace endpoints require the owning project's company (SEC-062)", () => {
+  async function plantForeignRowUnderProjectA(w: World) {
+    // Inconsistent stored row: company B's workspace pointing at project A.
+    return db()
+      .insert(projectWorkspaces)
+      .values({ companyId: w.companyB.id, projectId: w.projectA.id, name: "ws secret foreign", cwd: "/srv/foreign" })
+      .returning()
+      .then((r) => r[0]!);
+  }
+  const wsRow = (id: string) =>
+    db().select().from(projectWorkspaces).where(eq(projectWorkspaces.id, id)).then((r) => r[0] ?? null);
+
+  it("GET lists, PATCH and DELETE never reach a foreign workspace row", async () => {
+    const w = await seedWorld(db());
+    const foreign = await plantForeignRowUnderProjectA(w);
+
+    const list = await send(real.app, w.callers.member, "get", `/api/projects/${w.projectA.id}/workspaces`);
+    expect(list.status).toBe(200);
+    expect(JSON.stringify(list.body)).not.toContain("ws secret foreign");
+
+    const patch = await send(real.app, w.callers.member, "patch", `/api/projects/${w.projectA.id}/workspaces/${foreign.id}`, {
+      name: "hijacked",
+    });
+    expect(patch.status).toBe(404);
+    const del = await send(real.app, w.callers.member, "delete", `/api/projects/${w.projectA.id}/workspaces/${foreign.id}`);
+    expect(del.status).toBe(404);
+    expect(await wsRow(foreign.id)).toMatchObject({ name: "ws secret foreign", companyId: w.companyB.id });
+  });
+
+  it("same-company workspaces are listed, updated and deleted", async () => {
+    const w = await seedWorld(db());
+    await plantForeignRowUnderProjectA(w);
+    const created = await send(real.app, w.callers.member, "post", `/api/projects/${w.projectA.id}/workspaces`, {
+      name: "own",
+      cwd: "/srv/own",
+    });
+    expect(created.status).toBe(201);
+    const list = await send(real.app, w.callers.member, "get", `/api/projects/${w.projectA.id}/workspaces`);
+    expect(list.body.map((x: { id: string }) => x.id)).toEqual([created.body.id]);
+    const patch = await send(real.app, w.callers.member, "patch", `/api/projects/${w.projectA.id}/workspaces/${created.body.id}`, {
+      name: "renamed",
+    });
+    expect(patch.status).toBe(200);
+    expect((await wsRow(created.body.id))?.name).toBe("renamed");
+    const del = await send(real.app, w.callers.member, "delete", `/api/projects/${w.projectA.id}/workspaces/${created.body.id}`);
+    expect(del.status).toBe(200);
+    expect(await wsRow(created.body.id)).toBeNull();
+  });
+});

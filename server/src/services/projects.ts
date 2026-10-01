@@ -344,6 +344,14 @@ async function ensureSinglePrimaryWorkspace(
 }
 
 export function projectService(db: Db) {
+  async function projectCompanyId(projectId: string) {
+    return db
+      .select({ companyId: projects.companyId })
+      .from(projects)
+      .where(eq(projects.id, projectId))
+      .then((rows) => rows[0]?.companyId ?? null);
+  }
+
   return {
     list: async (companyId: string): Promise<ProjectWithGoals[]> => {
       const rows = await db.select().from(projects).where(eq(projects.companyId, companyId));
@@ -483,15 +491,17 @@ export function projectService(db: Db) {
         }),
 
     listWorkspaces: async (projectId: string): Promise<ProjectWorkspace[]> => {
+      const companyId = await projectCompanyId(projectId);
+      if (!companyId) return [];
       const rows = await db
         .select()
         .from(projectWorkspaces)
-        .where(eq(projectWorkspaces.projectId, projectId))
+        .where(and(eq(projectWorkspaces.projectId, projectId), eq(projectWorkspaces.companyId, companyId)))
         .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
       if (rows.length === 0) return [];
       const runtimeServicesByWorkspaceId = await listWorkspaceRuntimeServicesForProjectWorkspaces(
         db,
-        rows[0]!.companyId,
+        companyId,
         rows.map((workspace) => workspace.id),
       );
       return rows.map((row) =>
@@ -525,7 +535,7 @@ export function projectService(db: Db) {
       const existing = await db
         .select()
         .from(projectWorkspaces)
-        .where(eq(projectWorkspaces.projectId, projectId))
+        .where(and(eq(projectWorkspaces.projectId, projectId), eq(projectWorkspaces.companyId, project.companyId)))
         .orderBy(asc(projectWorkspaces.createdAt))
         .then((rows) => rows);
 
@@ -568,6 +578,10 @@ export function projectService(db: Db) {
       workspaceId: string,
       data: UpdateWorkspaceInput,
     ): Promise<ProjectWorkspace | null> => {
+      const companyId = await projectCompanyId(projectId);
+      if (!companyId) return null;
+      // SEC-062: a workspace row is only addressable under a project of its
+      // own company; the by-id writes below rely on this lookup.
       const existing = await db
         .select()
         .from(projectWorkspaces)
@@ -575,6 +589,7 @@ export function projectService(db: Db) {
           and(
             eq(projectWorkspaces.id, workspaceId),
             eq(projectWorkspaces.projectId, projectId),
+            eq(projectWorkspaces.companyId, companyId),
           ),
         )
         .then((rows) => rows[0] ?? null);
@@ -684,6 +699,10 @@ export function projectService(db: Db) {
     },
 
     removeWorkspace: async (projectId: string, workspaceId: string): Promise<ProjectWorkspace | null> => {
+      const companyId = await projectCompanyId(projectId);
+      if (!companyId) return null;
+      // SEC-062: a workspace row is only addressable under a project of its
+      // own company; the by-id writes below rely on this lookup.
       const existing = await db
         .select()
         .from(projectWorkspaces)
@@ -691,6 +710,7 @@ export function projectService(db: Db) {
           and(
             eq(projectWorkspaces.id, workspaceId),
             eq(projectWorkspaces.projectId, projectId),
+            eq(projectWorkspaces.companyId, companyId),
           ),
         )
         .then((rows) => rows[0] ?? null);
