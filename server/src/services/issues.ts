@@ -1328,16 +1328,18 @@ export function issueService(db: Db) {
       }> = [];
       const visited = new Set<string>([issueId]);
       const start = await db.select().from(issues).where(eq(issues.id, issueId)).then(r => r[0] ?? null);
-      let currentId = start?.parentId ?? null;
+      if (!start) return [];
+      // SEC-062: every expansion below is scoped to the starting issue's company.
+      const companyId = start.companyId;
+      let currentId = start.parentId ?? null;
       while (currentId && !visited.has(currentId) && raw.length < 50) {
         visited.add(currentId);
-        // SEC-062: the ancestor walk stops at the company boundary.
         const parent = await db.select({
           id: issues.id, identifier: issues.identifier, title: issues.title, description: issues.description,
           status: issues.status, priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId, projectId: issues.projectId,
           goalId: issues.goalId, parentId: issues.parentId,
-        }).from(issues).where(and(eq(issues.id, currentId), eq(issues.companyId, start!.companyId))).then(r => r[0] ?? null);
+        }).from(issues).where(and(eq(issues.id, currentId), eq(issues.companyId, companyId))).then(r => r[0] ?? null);
         if (!parent) break;
         raw.push({
           id: parent.id, identifier: parent.identifier ?? null, title: parent.title, description: parent.description ?? null,
@@ -1391,7 +1393,7 @@ export function issueService(db: Db) {
         const workspaceRows = await db
           .select()
           .from(projectWorkspaces)
-          .where(inArray(projectWorkspaces.projectId, projectIds))
+          .where(and(inArray(projectWorkspaces.projectId, projectIds), eq(projectWorkspaces.companyId, companyId)))
           .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
         const workspaceMap = new Map<string, Array<(typeof workspaceRows)[number]>>();
         for (const workspace of workspaceRows) {
@@ -1403,7 +1405,7 @@ export function issueService(db: Db) {
         const rows = await db.select({
           id: projects.id, name: projects.name, description: projects.description,
           status: projects.status, goalId: projects.goalId,
-        }).from(projects).where(inArray(projects.id, projectIds));
+        }).from(projects).where(and(inArray(projects.id, projectIds), eq(projects.companyId, companyId)));
         for (const r of rows) {
           const projectWorkspaceRows = workspaceMap.get(r.id) ?? [];
           const workspaces = projectWorkspaceRows.map((workspace) => ({
@@ -1434,7 +1436,7 @@ export function issueService(db: Db) {
         const rows = await db.select({
           id: goals.id, title: goals.title, description: goals.description,
           level: goals.level, status: goals.status,
-        }).from(goals).where(inArray(goals.id, goalIds));
+        }).from(goals).where(and(inArray(goals.id, goalIds), eq(goals.companyId, companyId)));
         for (const r of rows) goalMap.set(r.id, r);
       }
 

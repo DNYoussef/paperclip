@@ -14,6 +14,7 @@ import {
 import { listWorkspaceRuntimeServicesForProjectWorkspaces } from "./workspace-runtime.js";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { assertGoalsInCompany } from "./company-scoped-refs.js";
+import { unprocessable } from "../errors.js";
 
 type ProjectRow = typeof projects.$inferSelect;
 type ProjectWorkspaceRow = typeof projectWorkspaces.$inferSelect;
@@ -61,8 +62,17 @@ async function attachGoals(db: Db, rows: ProjectRow[]): Promise<ProjectWithGoals
       goalTitle: goals.title,
     })
     .from(projectGoals)
-    // SEC-062: a linked goal is only expanded when it belongs to the same company.
-    .innerJoin(goals, and(eq(projectGoals.goalId, goals.id), eq(goals.companyId, projectGoals.companyId)))
+    // SEC-062: a link row and its goal are only expanded when both belong to
+    // the owning project's company.
+    .innerJoin(projects, eq(projectGoals.projectId, projects.id))
+    .innerJoin(
+      goals,
+      and(
+        eq(projectGoals.goalId, goals.id),
+        eq(goals.companyId, projects.companyId),
+        eq(projectGoals.companyId, projects.companyId),
+      ),
+    )
     .where(inArray(projectGoals.projectId, projectIds));
 
   const map = new Map<string, ProjectGoalRef[]>();
@@ -153,11 +163,15 @@ async function attachWorkspaces(db: Db, rows: ProjectWithGoals[]): Promise<Proje
   if (rows.length === 0) return [];
 
   const projectIds = rows.map((r) => r.id);
-  const workspaceRows = await db
-    .select()
-    .from(projectWorkspaces)
-    .where(inArray(projectWorkspaces.projectId, projectIds))
-    .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
+  const companyByProject = new Map(rows.map((r) => [r.id, r.companyId]));
+  // SEC-062: a workspace row is only expanded under a project of its own company.
+  const workspaceRows = (
+    await db
+      .select()
+      .from(projectWorkspaces)
+      .where(inArray(projectWorkspaces.projectId, projectIds))
+      .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+  ).filter((workspace) => workspace.companyId === companyByProject.get(workspace.projectId));
   const runtimeServicesByWorkspaceId = await listWorkspaceRuntimeServicesForProjectWorkspaces(
     db,
     rows[0]!.companyId,
@@ -211,7 +225,13 @@ async function syncGoalLinks(db: Db, projectId: string, companyId: string, goalI
 
 /** Resolve goalIds from input, handling the legacy goalId field. */
 function resolveGoalIds(data: { goalIds?: string[]; goalId?: string | null }): string[] | undefined {
-  if (data.goalIds !== undefined) return data.goalIds;
+  if (data.goalIds !== undefined) {
+    // SEC-062: the legacy goalId may only restate the list, never add to it.
+    if (data.goalId && !data.goalIds.includes(data.goalId)) {
+      throw unprocessable("goalId conflicts with goalIds");
+    }
+    return data.goalIds;
+  }
   if (data.goalId !== undefined) {
     return data.goalId ? [data.goalId] : [];
   }
@@ -379,8 +399,8 @@ export function projectService(db: Db) {
         .where(eq(projects.companyId, companyId));
       projectData.name = resolveProjectNameForUniqueShortname(projectData.name, existingProjects);
 
-      // Also write goalId to the legacy column (first goal or null)
-      const legacyGoalId = ids && ids.length > 0 ? ids[0] : projectData.goalId ?? null;
+      // SEC-062: the legacy column derives only from the validated list.
+      const legacyGoalId = ids && ids.length > 0 ? ids[0] : null;
 
       const row = await db
         .insert(projects)

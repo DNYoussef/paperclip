@@ -62,7 +62,8 @@ export function issueApprovalService(db: Db) {
         })
         .from(issueApprovals)
         .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
-        .where(eq(issueApprovals.issueId, issueId))
+        // SEC-062: never expand a link to another company's approval.
+        .where(and(eq(issueApprovals.issueId, issueId), eq(approvals.companyId, issue.companyId)))
         .orderBy(desc(issueApprovals.createdAt));
       return result.map((approval) => ({
         ...approval,
@@ -100,7 +101,8 @@ export function issueApprovalService(db: Db) {
         })
         .from(issueApprovals)
         .innerJoin(issues, eq(issueApprovals.issueId, issues.id))
-        .where(eq(issueApprovals.approvalId, approvalId))
+        // SEC-062: never expand a link to another company's issue.
+        .where(and(eq(issueApprovals.approvalId, approvalId), eq(issues.companyId, approval.companyId)))
         .orderBy(desc(issueApprovals.createdAt));
     },
 

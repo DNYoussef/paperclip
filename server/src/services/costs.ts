@@ -195,7 +195,8 @@ export function costService(db: Db) {
         })
         .from(runProjectLinks)
         .innerJoin(heartbeatRuns, eq(runProjectLinks.runId, heartbeatRuns.id))
-        .innerJoin(projects, eq(runProjectLinks.projectId, projects.id))
+        // SEC-062: a foreign project linked from an issue is never named here.
+        .innerJoin(projects, and(eq(runProjectLinks.projectId, projects.id), eq(projects.companyId, companyId)))
         .where(and(...conditions))
         .groupBy(runProjectLinks.projectId, projects.name)
         .orderBy(desc(costCentsExpr));
