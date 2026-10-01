@@ -1,6 +1,8 @@
 import type { Request, RequestHandler } from "express";
 import type { IncomingHttpHeaders } from "node:http";
 import { betterAuth } from "better-auth";
+import { createAuthMiddleware } from "better-auth/api";
+import { and, eq, ne } from "drizzle-orm";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { toNodeHandler } from "better-auth/node";
 import type { Db } from "@paperclipai/db";
@@ -106,6 +108,36 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins?
     // SEC-060: every session deletion (sign-out, revoke-session,
     // revoke-sessions, revoke-other-sessions, user deletion) runs this hook
     // per deleted row, single or bulk, whatever headers the request carried.
+    // SEC-060: Better Auth enumerates bulk revocations with a default page
+    // (100 rows), so revoke-sessions runs the per-row delete hook for at most
+    // 100 sessions and revoke-other-sessions leaves sessions beyond the page
+    // valid. After either succeeds: revoke-sessions closes every stream of
+    // the user; revoke-other-sessions deletes every remaining other session
+    // itself and closes the streams of exactly the committed ids.
+    hooks: {
+      after: createAuthMiddleware(async (ctx) => {
+        if (ctx.path !== "/revoke-sessions" && ctx.path !== "/revoke-other-sessions") return;
+        const context = ctx.context as unknown as {
+          returned?: unknown;
+          session?: { session?: { id: string; userId: string } } | null;
+        };
+        const returned = context.returned as { status?: unknown } | undefined;
+        if (!returned || returned.status !== true) return;
+        const current = context.session?.session;
+        if (!current) return;
+        if (ctx.path === "/revoke-sessions") {
+          // Every session of the user is gone (the delete itself is not
+          // paged), so every stream of the user closes.
+          closeLiveEventsConnections({ userId: current.userId }, "all sessions revoked");
+          return;
+        }
+        const removed = await db
+          .delete(authSessions)
+          .where(and(eq(authSessions.userId, current.userId), ne(authSessions.id, current.id)))
+          .returning({ id: authSessions.id });
+        for (const row of removed) closeLiveEventsConnections({ sessionId: row.id }, "session revoked");
+      }),
+    },
     databaseHooks: {
       session: {
         delete: {

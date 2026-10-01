@@ -17,7 +17,7 @@ import {
   resolveBetterAuthSession,
   resolveBetterAuthSessionFromHeaders,
 } from "../auth/better-auth.js";
-import { companyMemberships } from "@paperclipai/db";
+import { authSessions, companyMemberships } from "@paperclipai/db";
 import request from "supertest";
 
 // SEC-060 end to end: real WebSocket clients against the real upgrade
@@ -560,6 +560,65 @@ describe("board revocation closes live sockets", () => {
     await expectClosed(sa);
     await expectClosed(sb);
     await expectOpen(mine, w.companyA.id);
+    mine.ws.close();
+  });
+
+  // Better Auth pages bulk session enumeration at 100 rows. 120 extra rows are
+  // inserted BEFORE the streaming sessions, so the streaming sessions fall
+  // outside the first page.
+  async function padSessions(userId: string, count: number) {
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    await real.db.insert(authSessions).values(
+      Array.from({ length: count }, (_, i) => ({
+        id: `pad-${userId}-${i}`,
+        token: `pad-token-${userId}-${i}`,
+        userId,
+        expiresAt,
+        createdAt: now,
+        updatedAt: now,
+      })),
+    );
+  }
+  const sessionCount = (userId: string) =>
+    real.db.select({ id: authSessions.id }).from(authSessions).where(eq(authSessions.userId, userId)).then((r) => r.length);
+
+  it("revoke-sessions with more than 100 sessions closes every stream and deletes every session", async () => {
+    const w = await seedWorld(real.db);
+    const user = await signUp(w);
+    await padSessions(user.userId, 120);
+    const late1 = await signIn(user.email);
+    const late2 = await signIn(user.email);
+    expect(await sessionCount(user.userId)).toBe(123);
+    const bystander = await signUp(w);
+    const s1 = await openTagged(w.companyA.id, { cookie: late1 });
+    const s2 = await openTagged(w.companyA.id, { cookie: late2 });
+    const control = await openTagged(w.companyA.id, { cookie: bystander.cookie });
+    const res = await authPost("/api/auth/revoke-sessions", user.cookie);
+    expect(res.status).toBe(200);
+    expect(await sessionCount(user.userId)).toBe(0);
+    await expectClosed(s1);
+    await expectClosed(s2);
+    await expectOpen(control, w.companyA.id);
+    control.ws.close();
+  });
+
+  it("revoke-other-sessions with more than 100 sessions leaves only the caller's session", async () => {
+    const w = await seedWorld(real.db);
+    const user = await signUp(w);
+    await padSessions(user.userId, 120);
+    const late1 = await signIn(user.email);
+    const late2 = await signIn(user.email);
+    const s1 = await openTagged(w.companyA.id, { cookie: late1 });
+    const s2 = await openTagged(w.companyA.id, { cookie: late2 });
+    const mine = await openTagged(w.companyA.id, { cookie: user.cookie });
+    const res = await authPost("/api/auth/revoke-other-sessions", user.cookie);
+    expect(res.status).toBe(200);
+    expect(await sessionCount(user.userId)).toBe(1);
+    await expectClosed(s1);
+    await expectClosed(s2);
+    await expectOpen(mine, w.companyA.id);
+    await expect(open(w.companyA.id, { cookie: late1 })).rejects.toThrow(/upgrade 403/);
     mine.ws.close();
   });
 
