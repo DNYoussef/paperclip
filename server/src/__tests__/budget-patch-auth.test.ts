@@ -103,6 +103,43 @@ describe("PATCH /agents/:id carrying a budget (SEC-055)", () => {
   });
 });
 
+describe("spend accounting is server-owned (SEC-055)", () => {
+  const spentOf = (agentId: string) =>
+    real.db.select({ spent: agents.spentMonthlyCents }).from(agents).where(eq(agents.id, agentId)).then((r) => r[0]!.spent);
+
+  it("an agent cannot reset its own spentMonthlyCents through PATCH", async () => {
+    const w = await seedWorld(real.db);
+    await real.db.update(agents).set({ spentMonthlyCents: 500 }).where(eq(agents.id, w.agentA.id));
+    const res = await send(real.app, w.callers.targetAgent, "patch", `/api/agents/${w.agentA.id}`, {
+      spentMonthlyCents: 0,
+    });
+    expect(res.status).toBe(403);
+    expect(await spentOf(w.agentA.id)).toBe(500);
+  });
+
+  it("an agent cannot change spend and a harmless field together", async () => {
+    const w = await seedWorld(real.db);
+    await real.db.update(agents).set({ spentMonthlyCents: 500 }).where(eq(agents.id, w.agentA.id));
+    const res = await send(real.app, w.callers.targetAgent, "patch", `/api/agents/${w.agentA.id}`, {
+      title: "x",
+      spentMonthlyCents: 0,
+    });
+    expect(res.status).toBe(403);
+    expect(await spentOf(w.agentA.id)).toBe(500);
+    expect((await budgetOf(w.agentA.id)).title).toBeNull();
+  });
+
+  it("a board member may correct spend", async () => {
+    const w = await seedWorld(real.db);
+    await real.db.update(agents).set({ spentMonthlyCents: 500 }).where(eq(agents.id, w.agentA.id));
+    const res = await send(real.app, w.callers.member, "patch", `/api/agents/${w.agentA.id}`, {
+      spentMonthlyCents: 0,
+    });
+    expect(res.status).toBe(200);
+    expect(await spentOf(w.agentA.id)).toBe(0);
+  });
+});
+
 describe("config rollback carrying a budget (SEC-055)", () => {
   async function revisionWithBudget(w: Awaited<ReturnType<typeof seedWorld>>) {
     // The board raises the budget (recording a revision whose afterConfig has

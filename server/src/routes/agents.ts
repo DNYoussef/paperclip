@@ -128,16 +128,20 @@ export function agentRoutes(db: Db) {
     throw forbidden("Only CEO or agent creators can modify other agents");
   }
 
-  // SEC-055: an existing budget only changes with board access to the agent's
-  // company, whichever route carries the change (PATCH, rollback, budgets).
-  function assertCanChangeBudget(
+  // SEC-055: budget and spend accounting are board-owned. An existing value
+  // only changes with board access to the agent's company, whichever route
+  // carries the change (PATCH, rollback, budgets). Spend is otherwise written
+  // only by the server from cost events.
+  const ACCOUNTING_FIELDS = ["budgetMonthlyCents", "spentMonthlyCents"] as const;
+  function assertCanChangeAccounting(
     req: Request,
-    existing: { companyId: string; budgetMonthlyCents: number },
-    nextBudget: unknown,
+    existing: { companyId: string; budgetMonthlyCents: number; spentMonthlyCents: number },
+    patch: Partial<Record<(typeof ACCOUNTING_FIELDS)[number], unknown>>,
   ) {
-    if (nextBudget === undefined || nextBudget === existing.budgetMonthlyCents) return;
+    const changed = ACCOUNTING_FIELDS.some((field) => patch[field] !== undefined && patch[field] !== existing[field]);
+    if (!changed) return;
     assertCompanyAccess(req, existing.companyId);
-    if (req.actor.type !== "board") throw forbidden("Board access required to change a budget");
+    if (req.actor.type !== "board") throw forbidden("Board access required to change budget or spend");
   }
 
   async function resolveCompanyIdForAgentReference(req: Request): Promise<string | null> {
@@ -664,11 +668,9 @@ export function agentRoutes(db: Db) {
       return;
     }
     const revisionBudget = (revision.afterConfig as Record<string, unknown> | null)?.budgetMonthlyCents;
-    assertCanChangeBudget(
-      req,
-      existing,
-      typeof revisionBudget === "number" ? Math.max(0, Math.floor(revisionBudget)) : undefined,
-    );
+    assertCanChangeAccounting(req, existing, {
+      budgetMonthlyCents: typeof revisionBudget === "number" ? Math.max(0, Math.floor(revisionBudget)) : undefined,
+    });
 
     const actor = getActorInfo(req);
     const updated = await svc.rollbackConfigRevision(id, revisionId, {
@@ -1074,7 +1076,7 @@ export function agentRoutes(db: Db) {
       res.status(422).json({ error: "Use /api/agents/:id/permissions for permission changes" });
       return;
     }
-    assertCanChangeBudget(req, existing, (req.body as Record<string, unknown>).budgetMonthlyCents);
+    assertCanChangeAccounting(req, existing, req.body as Record<string, unknown>);
 
     const patchData = { ...(req.body as Record<string, unknown>) };
     if (Object.prototype.hasOwnProperty.call(patchData, "adapterConfig")) {
