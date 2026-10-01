@@ -493,6 +493,7 @@ export function agentService(db: Db) {
       id: string,
       revisionId: string,
       actor: { agentId?: string | null; userId?: string | null },
+      options?: { omitAccounting?: boolean },
     ) => {
       const revision = await db
         .select()
@@ -505,6 +506,8 @@ export function agentService(db: Db) {
       }
 
       const patch = configPatchFromSnapshot(revision.afterConfig);
+      // SEC-055: a non-board rollback never writes the board-owned budget.
+      if (options?.omitAccounting) delete patch.budgetMonthlyCents;
       return updateAgent(id, patch, {
         recordRevision: {
           createdByAgentId: actor.agentId ?? null,

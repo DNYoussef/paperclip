@@ -1,7 +1,31 @@
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agentConfigRevisions, agents, companies } from "@paperclipai/db";
 import { send, seedWorld, startRealApp, type RealApp } from "./helpers/real-app.js";
+
+// Deterministic interleaving hook: the agent PATCH route awaits adapter-config
+// normalization between its authorization check and its write. A test sets
+// hooks.duringNormalize to run a concurrent writer exactly in that gap.
+const hooks = vi.hoisted(() => ({ duringNormalize: null as null | (() => Promise<void>) }));
+vi.mock("../services/secrets.js", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("../services/secrets.js")>();
+  return {
+    ...mod,
+    secretService: (db: any) => {
+      const svc = mod.secretService(db);
+      return {
+        ...svc,
+        normalizeAdapterConfigForPersistence: async (...args: Parameters<typeof svc.normalizeAdapterConfigForPersistence>) => {
+          const result = await svc.normalizeAdapterConfigForPersistence(...args);
+          const hook = hooks.duringNormalize;
+          hooks.duringNormalize = null;
+          if (hook) await hook();
+          return result;
+        },
+      };
+    },
+  };
+});
 
 // SEC-055: an existing budget changes only with board access to the agent's
 // company. Every path is covered (budgets PATCH, general agent PATCH, config
@@ -137,6 +161,81 @@ describe("spend accounting is server-owned (SEC-055)", () => {
     });
     expect(res.status).toBe(200);
     expect(await spentOf(w.agentA.id)).toBe(0);
+  });
+});
+
+describe("non-board writes never store accounting fields (SEC-055)", () => {
+  const accountingOf = (agentId: string) =>
+    real.db
+      .select({ budget: agents.budgetMonthlyCents, spent: agents.spentMonthlyCents, title: agents.title })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((r) => r[0]!);
+
+  it("an agent PATCH echoing unchanged accounting values does not overwrite a concurrent spend increment or board budget cut", async () => {
+    const w = await seedWorld(real.db);
+    await real.db.update(agents).set({ spentMonthlyCents: 500, budgetMonthlyCents: 1000 }).where(eq(agents.id, w.agentA.id));
+    hooks.duringNormalize = async () => {
+      // A cost event and a board budget reduction land between the route's
+      // check and its write.
+      await real.db.update(agents).set({ spentMonthlyCents: 525, budgetMonthlyCents: 600 }).where(eq(agents.id, w.agentA.id));
+    };
+    const res = await send(real.app, w.callers.targetAgent, "patch", `/api/agents/${w.agentA.id}`, {
+      title: "Echo",
+      adapterConfig: {},
+      spentMonthlyCents: 500,
+      budgetMonthlyCents: 1000,
+    });
+    expect(hooks.duringNormalize).toBeNull();
+    expect(res.status).toBe(200);
+    expect(await accountingOf(w.agentA.id)).toEqual({ budget: 600, spent: 525, title: "Echo" });
+  });
+
+  it("an agent rollback to a revision with an equal budget keeps the stored budget and rolls back the rest", async () => {
+    const w = await seedWorld(real.db);
+    expect((await send(real.app, w.callers.member, "patch", `/api/agents/${w.agentA.id}`, { title: "v1" })).status).toBe(200);
+    expect((await send(real.app, w.callers.member, "patch", `/api/agents/${w.agentA.id}`, { title: "v2" })).status).toBe(200);
+    const revisions = await real.db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, w.agentA.id));
+    const v1 = revisions.find((r) => (r.afterConfig as Record<string, unknown>).title === "v1")!;
+    const res = await send(real.app, w.callers.targetAgent, "post", `/api/agents/${w.agentA.id}/config-revisions/${v1.id}/rollback`);
+    expect(res.status).toBe(200);
+    expect(await accountingOf(w.agentA.id)).toMatchObject({ title: "v1", budget: 100 });
+  });
+});
+
+describe("company import replace is a board operation (SEC-055)", () => {
+  async function bundleWithBudget(w: Awaited<ReturnType<typeof seedWorld>>, budget: number) {
+    const exported = await send(real.app, w.callers.member, "post", `/api/companies/${w.companyA.id}/export`, {
+      include: { company: false, agents: true },
+    });
+    expect(exported.status).toBe(200);
+    const manifest = exported.body.manifest;
+    for (const agent of manifest.agents) agent.budgetMonthlyCents = budget;
+    return {
+      source: { type: "inline", manifest, files: exported.body.files },
+      include: { company: false, agents: true },
+      target: { mode: "existing_company", companyId: w.companyA.id },
+      collisionStrategy: "replace",
+    };
+  }
+
+  it("an agent import with collisionStrategy=replace is refused before any write", async () => {
+    const w = await seedWorld(real.db);
+    const body = await bundleWithBudget(w, 999_999);
+    for (const caller of [w.callers.targetAgent, w.callers.peerAgent]) {
+      const res = await send(real.app, caller, "post", "/api/companies/import", body);
+      expect(res.status).toBe(403);
+    }
+    expect((await budgetOf(w.agentA.id)).budget).toBe(100);
+    expect((await budgetOf(w.peerA.id)).budget).toBe(100);
+  });
+
+  it("a board member import replaces the budgets", async () => {
+    const w = await seedWorld(real.db);
+    const body = await bundleWithBudget(w, 4321);
+    const res = await send(real.app, w.callers.member, "post", "/api/companies/import", body);
+    expect(res.status).toBe(200);
+    expect((await budgetOf(w.agentA.id)).budget).toBe(4321);
   });
 });
 

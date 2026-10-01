@@ -128,20 +128,21 @@ export function agentRoutes(db: Db) {
     throw forbidden("Only CEO or agent creators can modify other agents");
   }
 
-  // SEC-055: budget and spend accounting are board-owned. An existing value
-  // only changes with board access to the agent's company, whichever route
-  // carries the change (PATCH, rollback, budgets). Spend is otherwise written
-  // only by the server from cost events.
+  // SEC-055: budget and spend accounting are board-owned. Only board callers
+  // write them (PATCH, rollback, budgets); spend is otherwise written by the
+  // server from cost events. For any other caller a differing value is
+  // refused and an equal one is stripped, so a non-board write never stores
+  // a stale accounting snapshot over a concurrent board or cost update.
   const ACCOUNTING_FIELDS = ["budgetMonthlyCents", "spentMonthlyCents"] as const;
-  function assertCanChangeAccounting(
+  function callerOwnsAccounting(
     req: Request,
     existing: { companyId: string; budgetMonthlyCents: number; spentMonthlyCents: number },
     patch: Partial<Record<(typeof ACCOUNTING_FIELDS)[number], unknown>>,
   ) {
+    if (req.actor.type === "board") return true;
     const changed = ACCOUNTING_FIELDS.some((field) => patch[field] !== undefined && patch[field] !== existing[field]);
-    if (!changed) return;
-    assertCompanyAccess(req, existing.companyId);
-    if (req.actor.type !== "board") throw forbidden("Board access required to change budget or spend");
+    if (changed) throw forbidden("Board access required to change budget or spend");
+    return false;
   }
 
   async function resolveCompanyIdForAgentReference(req: Request): Promise<string | null> {
@@ -668,15 +669,20 @@ export function agentRoutes(db: Db) {
       return;
     }
     const revisionBudget = (revision.afterConfig as Record<string, unknown> | null)?.budgetMonthlyCents;
-    assertCanChangeAccounting(req, existing, {
+    const ownsAccounting = callerOwnsAccounting(req, existing, {
       budgetMonthlyCents: typeof revisionBudget === "number" ? Math.max(0, Math.floor(revisionBudget)) : undefined,
     });
 
     const actor = getActorInfo(req);
-    const updated = await svc.rollbackConfigRevision(id, revisionId, {
-      agentId: actor.agentId,
-      userId: actor.actorType === "user" ? actor.actorId : null,
-    });
+    const updated = await svc.rollbackConfigRevision(
+      id,
+      revisionId,
+      {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      },
+      { omitAccounting: !ownsAccounting },
+    );
     if (!updated) {
       res.status(404).json({ error: "Revision not found" });
       return;
@@ -1076,9 +1082,10 @@ export function agentRoutes(db: Db) {
       res.status(422).json({ error: "Use /api/agents/:id/permissions for permission changes" });
       return;
     }
-    assertCanChangeAccounting(req, existing, req.body as Record<string, unknown>);
+    const ownsAccounting = callerOwnsAccounting(req, existing, req.body as Record<string, unknown>);
 
     const patchData = { ...(req.body as Record<string, unknown>) };
+    if (!ownsAccounting) for (const field of ACCOUNTING_FIELDS) delete patchData[field];
     if (Object.prototype.hasOwnProperty.call(patchData, "adapterConfig")) {
       const adapterConfig = asRecord(patchData.adapterConfig);
       if (!adapterConfig) {

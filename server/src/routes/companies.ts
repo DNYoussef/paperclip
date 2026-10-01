@@ -81,11 +81,14 @@ export function companyRoutes(db: Db, opts: { companyDeletionEnabled: boolean } 
   });
 
   router.post("/import", validate(companyPortabilityImportSchema), async (req, res) => {
+    // SEC-055/SEC-056: an import creates and replaces agents wholesale,
+    // including board-owned budgets, permissions and adapter config, so it
+    // is a board operation for existing companies too. Preview stays open
+    // to same-company callers (read-only).
     if (req.body.target.mode === "existing_company") {
       assertCompanyAccess(req, req.body.target.companyId);
-    } else {
-      assertBoard(req);
     }
+    assertBoard(req);
     const actor = getActorInfo(req);
     const result = await portability.importBundle(req.body, req.actor.type === "board" ? req.actor.userId : null);
     await logActivity(db, {
