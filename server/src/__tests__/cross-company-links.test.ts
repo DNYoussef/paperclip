@@ -488,3 +488,49 @@ describe("workspace endpoints require the owning project's company (SEC-062)", (
     expect(await wsRow(created.body.id)).toBeNull();
   });
 });
+
+describe("wakeup coalescing never follows a foreign run link (SEC-056)", () => {
+  const runRow = (id: string) =>
+    db().select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then((r) => r[0]!);
+
+  it("a stored foreign execution link is cleared, not coalesced into, disclosed or mutated", async () => {
+    const w = await seedWorld(db());
+    const runB = await db()
+      .insert(heartbeatRuns)
+      .values({ companyId: w.companyB.id, agentId: w.agentB.id, status: "running", contextSnapshot: { secret: "company B output" } })
+      .returning()
+      .then((r) => r[0]!);
+    await db()
+      .update(issues)
+      .set({ executionRunId: runB.id, executionAgentNameKey: w.agentA.name.toLowerCase(), status: "in_progress" })
+      .where(eq(issues.id, w.issueA.id));
+
+    const res = await send(real.app, w.callers.member, "post", `/api/agents/${w.agentA.id}/wakeup`, {
+      payload: { issueId: w.issueA.id },
+    });
+    expect(res.status).toBeLessThan(300);
+    expect(res.body?.id).not.toBe(runB.id);
+    expect(JSON.stringify(res.body)).not.toContain("company B output");
+    expect((await runRow(runB.id)).contextSnapshot).toEqual({ secret: "company B output" });
+    const issue = await db().select().from(issues).where(eq(issues.id, w.issueA.id)).then((r) => r[0]!);
+    expect(issue.executionRunId).not.toBe(runB.id);
+  });
+
+  it("control: a same-company execution link is coalesced", async () => {
+    const w = await seedWorld(db());
+    await db()
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId: w.issueA.id } })
+      .where(eq(heartbeatRuns.id, w.runA.id));
+    await db()
+      .update(issues)
+      .set({ executionRunId: w.runA.id, executionAgentNameKey: w.agentA.name.toLowerCase(), status: "in_progress" })
+      .where(eq(issues.id, w.issueA.id));
+    const res = await send(real.app, w.callers.member, "post", `/api/agents/${w.agentA.id}/wakeup`, {
+      payload: { issueId: w.issueA.id },
+    });
+    expect(res.status).toBe(202);
+    expect(res.body.id).toBe(w.runA.id);
+    expect((await runRow(w.runA.id)).contextSnapshot).toMatchObject({ issueId: w.issueA.id });
+  });
+});

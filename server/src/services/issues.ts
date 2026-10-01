@@ -387,11 +387,12 @@ export function issueService(db: Db) {
     );
   }
 
-  async function isTerminalOrMissingHeartbeatRun(runId: string) {
+  // SEC-056: a run of another company counts as missing for lock adoption.
+  async function isTerminalOrMissingHeartbeatRun(runId: string, companyId: string) {
     const run = await db
       .select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)))
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
     return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
@@ -403,7 +404,13 @@ export function issueService(db: Db) {
     actorRunId: string;
     expectedCheckoutRunId: string;
   }) {
-    const stale = await isTerminalOrMissingHeartbeatRun(input.expectedCheckoutRunId);
+    const owner = await db
+      .select({ companyId: issues.companyId })
+      .from(issues)
+      .where(eq(issues.id, input.issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!owner) return null;
+    const stale = await isTerminalOrMissingHeartbeatRun(input.expectedCheckoutRunId, owner.companyId);
     if (!stale) return null;
 
     const now = new Date();

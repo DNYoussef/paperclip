@@ -1979,11 +1979,13 @@ export function heartbeatService(db: Db) {
           return { kind: "skipped" as const };
         }
 
+        // SEC-056: a stored execution link is only followed inside the issue's
+        // company; a foreign link resolves to nothing and is cleared below.
         let activeExecutionRun = issue.executionRunId
           ? await tx
             .select()
             .from(heartbeatRuns)
-            .where(eq(heartbeatRuns.id, issue.executionRunId))
+            .where(and(eq(heartbeatRuns.id, issue.executionRunId), eq(heartbeatRuns.companyId, issue.companyId)))
             .then((rows) => rows[0] ?? null)
           : null;
 
@@ -2044,7 +2046,7 @@ export function heartbeatService(db: Db) {
           const executionAgent = await tx
             .select({ name: agents.name })
             .from(agents)
-            .where(eq(agents.id, activeExecutionRun.agentId))
+            .where(and(eq(agents.id, activeExecutionRun.agentId), eq(agents.companyId, issue.companyId)))
             .then((rows) => rows[0] ?? null);
           const executionAgentNameKey =
             normalizeAgentNameKey(issue.executionAgentNameKey) ??
@@ -2067,7 +2069,7 @@ export function heartbeatService(db: Db) {
                 contextSnapshot: mergedContextSnapshot,
                 updatedAt: new Date(),
               })
-              .where(eq(heartbeatRuns.id, activeExecutionRun.id))
+              .where(and(eq(heartbeatRuns.id, activeExecutionRun.id), eq(heartbeatRuns.companyId, issue.companyId)))
               .returning()
               .then((rows) => rows[0] ?? activeExecutionRun);
 
