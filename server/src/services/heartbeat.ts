@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, ne, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -227,6 +227,11 @@ function parseIssueAssigneeAdapterOverrides(
     useProjectWorkspace,
   };
 }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// SEC-060: agents in these states never start or continue run setup.
+const UNRUNNABLE_AGENT_STATUSES = ["paused", "terminated", "pending_approval"];
 
 function deriveTaskKey(
   contextSnapshot: Record<string, unknown> | null | undefined,
@@ -908,7 +913,7 @@ export function heartbeatService(db: Db) {
     const existing = await getAgent(agentId);
     if (!existing) return;
 
-    if (existing.status === "paused" || existing.status === "terminated") {
+    if (UNRUNNABLE_AGENT_STATUSES.includes(existing.status)) {
       return;
     }
 
@@ -927,8 +932,8 @@ export function heartbeatService(db: Db) {
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      // SEC-060: never move a paused or terminated agent (read above) back.
-      .where(and(eq(agents.id, agentId), notInArray(agents.status, ["paused", "terminated"])))
+      // SEC-060: never move a paused, pending or terminated agent back.
+      .where(and(eq(agents.id, agentId), notInArray(agents.status, UNRUNNABLE_AGENT_STATUSES)))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -1087,6 +1092,38 @@ export function heartbeatService(db: Db) {
       }
       return claimedRuns;
     });
+  }
+
+  async function unrunnableReasonFor(runId: string, agentId: string) {
+    const [currentRun, currentAgent] = await Promise.all([
+      getRun(runId),
+      db
+        .select({ status: agents.status })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    if (!currentRun || currentRun.status !== "running") return "Run is no longer running";
+    if (!currentAgent || UNRUNNABLE_AGENT_STATUSES.includes(currentAgent.status)) return "Agent is not runnable";
+    return null;
+  }
+
+  // Ends a run whose setup was overtaken by a cancel, pause or termination,
+  // without launching the adapter and without touching the agent's status.
+  async function abortUnrunnableRun(run: typeof heartbeatRuns.$inferSelect, reason: string) {
+    const current = await getRun(run.id);
+    if (current && (current.status === "running" || current.status === "queued")) {
+      await setRunStatus(run.id, "cancelled", {
+        finishedAt: new Date(),
+        error: reason,
+        errorCode: "cancelled",
+      });
+      await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: new Date(), error: reason });
+    }
+    const finished = await getRun(run.id);
+    if (finished) await releaseIssueExecutionAndPromote(finished);
+    // Undo our own "running" mark for a live agent; paused/terminated stay.
+    await finalizeAgentStatus(run.agentId, "cancelled");
   }
 
   async function executeRun(runId: string) {
@@ -1306,10 +1343,14 @@ export function heartbeatService(db: Db) {
       const runningAgent = await db
         .update(agents)
         .set({ status: "running", updatedAt: new Date() })
-        // SEC-060: terminated is terminal, even for a run that was already starting.
-        .where(and(eq(agents.id, agent.id), ne(agents.status, "terminated")))
+        // SEC-060: a paused, pending or terminated agent is never moved to running.
+        .where(and(eq(agents.id, agent.id), notInArray(agents.status, UNRUNNABLE_AGENT_STATUSES)))
         .returning()
         .then((rows) => rows[0] ?? null);
+      if (!runningAgent) {
+        await abortUnrunnableRun(run, "Agent is not runnable");
+        return;
+      }
 
       if (runningAgent) {
         publishLiveEvent({
@@ -1412,10 +1453,10 @@ export function heartbeatService(db: Db) {
           })
           .where(eq(heartbeatRuns.id, run.id));
       }
-      if (issueId && (executionWorkspace.created || runtimeServices.some((service) => !service.reused))) {
+      if (issueRef && (executionWorkspace.created || runtimeServices.some((service) => !service.reused))) {
         try {
           await issuesSvc.addComment(
-            issueId,
+            issueRef.id,
             buildWorkspaceReadyComment({
               workspace: executionWorkspace,
               runtimeServices,
@@ -1459,6 +1500,13 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      // SEC-060: setup awaited workspaces, services and logs; re-check that the
+      // run is still running and the agent still runnable right before launch.
+      const unrunnableReason = await unrunnableReasonFor(run.id, agent.id);
+      if (unrunnableReason) {
+        await abortUnrunnableRun(run, unrunnableReason);
+        return;
+      }
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
@@ -1499,10 +1547,10 @@ export function heartbeatService(db: Db) {
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id));
-        if (issueId) {
+        if (issueRef) {
           try {
             await issuesSvc.addComment(
-              issueId,
+              issueRef.id,
               buildWorkspaceReadyComment({
                 workspace: executionWorkspace,
                 runtimeServices: adapterManagedRuntimeServices,
@@ -1930,6 +1978,23 @@ export function heartbeatService(db: Db) {
         finishedAt: new Date(),
       });
     };
+
+    // SEC-056: a caller-supplied issue id (payload or context) must belong to
+    // the agent's company before any branch, including the reasons that skip
+    // the issue execution lock. A foreign or malformed id is never queued.
+    if (issueId) {
+      const ownIssue = UUID_RE.test(issueId)
+        ? await db
+            .select({ id: issues.id })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+            .then((rows) => rows[0] ?? null)
+        : null;
+      if (!ownIssue) {
+        await writeSkippedRequest("issue_execution_issue_not_found");
+        return null;
+      }
+    }
 
     if (source === "timer" && !policy.enabled) {
       await writeSkippedRequest("heartbeat.disabled");

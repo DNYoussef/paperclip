@@ -534,3 +534,19 @@ describe("wakeup coalescing never follows a foreign run link (SEC-056)", () => {
     expect((await runRow(w.runA.id)).contextSnapshot).toMatchObject({ issueId: w.issueA.id });
   });
 });
+
+describe("wakeup reasons cannot bypass issue ownership (SEC-056)", () => {
+  it("issue_comment_mentioned with a foreign issue id is skipped through the HTTP route", async () => {
+    const w = await seedWorld(db());
+    for (const caller of [w.callers.member, w.callers.peerAgent]) {
+      const res = await send(real.app, caller, "post", `/api/agents/${w.peerA.id}/wakeup`, {
+        reason: "issue_comment_mentioned",
+        payload: { issueId: w.issueB.id },
+      });
+      expect(res.status).toBe(202);
+      expect(res.body).toEqual({ status: "skipped" });
+    }
+    const runs = await db().select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, w.peerA.id));
+    expect(runs).toHaveLength(0);
+  });
+});
