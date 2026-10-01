@@ -23,7 +23,6 @@ interface ApprovalListOptions extends BaseClientOptions {
 
 interface ApprovalDecisionOptions extends BaseClientOptions {
   decisionNote?: string;
-  decidedByUserId?: string;
 }
 
 interface ApprovalCreateOptions extends BaseClientOptions {
@@ -140,13 +139,11 @@ export function registerApprovalCommands(program: Command): void {
       .description("Approve an approval request")
       .argument("<approvalId>", "Approval ID")
       .option("--decision-note <text>", "Decision note")
-      .option("--decided-by-user-id <id>", "Decision actor user ID")
       .action(async (approvalId: string, opts: ApprovalDecisionOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
           const payload = resolveApprovalSchema.parse({
             decisionNote: opts.decisionNote,
-            decidedByUserId: opts.decidedByUserId,
           });
           const updated = await ctx.api.post<Approval>(`/api/approvals/${approvalId}/approve`, payload);
           printOutput(updated, { json: ctx.json });
@@ -162,13 +159,11 @@ export function registerApprovalCommands(program: Command): void {
       .description("Reject an approval request")
       .argument("<approvalId>", "Approval ID")
       .option("--decision-note <text>", "Decision note")
-      .option("--decided-by-user-id <id>", "Decision actor user ID")
       .action(async (approvalId: string, opts: ApprovalDecisionOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
           const payload = resolveApprovalSchema.parse({
             decisionNote: opts.decisionNote,
-            decidedByUserId: opts.decidedByUserId,
           });
           const updated = await ctx.api.post<Approval>(`/api/approvals/${approvalId}/reject`, payload);
           printOutput(updated, { json: ctx.json });
@@ -184,13 +179,11 @@ export function registerApprovalCommands(program: Command): void {
       .description("Request revision for an approval")
       .argument("<approvalId>", "Approval ID")
       .option("--decision-note <text>", "Decision note")
-      .option("--decided-by-user-id <id>", "Decision actor user ID")
       .action(async (approvalId: string, opts: ApprovalDecisionOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
           const payload = requestApprovalRevisionSchema.parse({
             decisionNote: opts.decisionNote,
-            decidedByUserId: opts.decidedByUserId,
           });
           const updated = await ctx.api.post<Approval>(`/api/approvals/${approvalId}/request-revision`, payload);
           printOutput(updated, { json: ctx.json });
