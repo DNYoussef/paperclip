@@ -11,6 +11,7 @@ import {
   authVerifications,
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
+import { closeLiveEventsConnections } from "../services/live-events.js";
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -102,6 +103,18 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins?
       disableSignUp: config.authDisableSignUp,
     },
     ...(isHttpOnly ? { advanced: { useSecureCookies: false } } : {}),
+    // SEC-060: every session deletion (sign-out, revoke-session,
+    // revoke-sessions, revoke-other-sessions, user deletion) runs this hook
+    // per deleted row, single or bulk, whatever headers the request carried.
+    databaseHooks: {
+      session: {
+        delete: {
+          after: async (session: { id: string }) => {
+            closeLiveEventsConnections({ sessionId: session.id }, "session revoked");
+          },
+        },
+      },
+    },
   };
 
   if (!baseUrl) {

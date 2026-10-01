@@ -10,6 +10,15 @@ import { accessService } from "../services/index.js";
 import { publishLiveEvent } from "../services/live-events.js";
 import { buildApp, send, seedWorld, startRealApp, type RealApp, type World } from "./helpers/real-app.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { createApp } from "../app.js";
+import {
+  createBetterAuthHandler,
+  createBetterAuthInstance,
+  resolveBetterAuthSession,
+  resolveBetterAuthSessionFromHeaders,
+} from "../auth/better-auth.js";
+import { companyMemberships } from "@paperclipai/db";
+import request from "supertest";
 
 // SEC-060 end to end: real WebSocket clients against the real upgrade
 // handler, the real app and PostgreSQL. Each revocation is performed by the
@@ -24,13 +33,40 @@ let real: RealApp;
 let server: Server;
 let wss: { close: () => void };
 let base: string;
+// The real Better Auth instance over the same database. Board sockets that
+// carry a session cookie are authorized through it; the rest of the file
+// uses header-driven test sessions.
+let auth: ReturnType<typeof createBetterAuthInstance>;
+let authApp: Awaited<ReturnType<typeof createApp>>;
+const AUTH_ORIGIN = "http://localhost:3100";
 
 beforeAll(async () => {
   real = await startRealApp();
+  auth = createBetterAuthInstance(real.db, {
+    authBaseUrlMode: "explicit",
+    authPublicBaseUrl: AUTH_ORIGIN,
+    deploymentMode: "authenticated",
+    allowedHostnames: [],
+    authDisableSignUp: false,
+  } as any);
+  authApp = await createApp(real.db, {
+    uiMode: "none",
+    serverPort: 0,
+    storageService: {} as any,
+    deploymentMode: "authenticated",
+    deploymentExposure: "public",
+    allowedHostnames: [],
+    bindHost: "127.0.0.1",
+    authReady: true,
+    companyDeletionEnabled: false,
+    betterAuthHandler: createBetterAuthHandler(auth),
+    resolveSession: (req) => resolveBetterAuthSession(auth, req),
+  });
   server = createServer(real.app);
   wss = setupLiveEventsWebSocketServer(server, real.db as any, {
     deploymentMode: "authenticated",
     resolveSessionFromHeaders: async (headers: Headers) => {
+      if (headers.get("cookie")) return resolveBetterAuthSessionFromHeaders(auth, headers);
       const userId = headers.get("x-test-user");
       if (!userId) return null;
       const sessionId = headers.get("x-test-session") ?? `session-${userId}`;
@@ -56,13 +92,15 @@ interface Client {
   closed: Promise<{ code: number }>;
 }
 
-type Who = { token: string } | { userId: string; sessionId?: string };
+type Who = { token: string } | { userId: string; sessionId?: string } | { cookie: string };
 
 function open(companyId: string, who: Who): Promise<Client> {
   const headers: Record<string, string> =
     "token" in who
       ? { authorization: `Bearer ${who.token}` }
-      : { "x-test-user": who.userId, ...(who.sessionId ? { "x-test-session": who.sessionId } : {}) };
+      : "cookie" in who
+        ? { cookie: who.cookie }
+        : { "x-test-user": who.userId, ...(who.sessionId ? { "x-test-session": who.sessionId } : {}) };
   const ws = new WebSocket(`${base}/api/companies/${companyId}/events/ws`, { headers });
   const events: unknown[] = [];
   ws.on("message", (data: Buffer) => events.push(JSON.parse(data.toString())));
@@ -97,6 +135,54 @@ async function openTagged(companyId: string, who: Who) {
   const client = await open(companyId, who);
   (client as any).companyId = companyId;
   return client;
+}
+
+// Real Better Auth sessions: sign-up/sign-in through the real handler; the
+// user joins company A so its cookie can open company A's stream.
+function cookieOf(res: { headers: Record<string, unknown> }) {
+  const raw = res.headers["set-cookie"];
+  const list = Array.isArray(raw) ? raw : raw ? [String(raw)] : [];
+  return list.map((c) => String(c).split(";")[0]).join("; ");
+}
+
+function authPost(path: string, cookie: string, body: Record<string, unknown> = {}, extra: Record<string, string> = {}) {
+  let req = request(authApp).post(path).set("origin", AUTH_ORIGIN).set("cookie", cookie);
+  for (const [k, v] of Object.entries(extra)) req = req.set(k, v);
+  return req.send(body);
+}
+
+let userSeq = 0;
+async function signUp(w: World) {
+  const email = `u${++userSeq}-${w.companyA.id.slice(0, 8)}@example.test`;
+  const res = await request(authApp)
+    .post("/api/auth/sign-up/email")
+    .set("origin", AUTH_ORIGIN)
+    .send({ name: "Test User", email, password: "correct-horse-battery" });
+  expect(res.status).toBe(200);
+  const userId = res.body.user.id as string;
+  await real.db.insert(companyMemberships).values({
+    companyId: w.companyA.id,
+    principalType: "user",
+    principalId: userId,
+    status: "active",
+    membershipRole: "member",
+  });
+  return { email, userId, cookie: cookieOf(res) };
+}
+
+async function signIn(email: string) {
+  const res = await request(authApp)
+    .post("/api/auth/sign-in/email")
+    .set("origin", AUTH_ORIGIN)
+    .send({ email, password: "correct-horse-battery" });
+  expect(res.status).toBe(200);
+  return cookieOf(res);
+}
+
+async function sessionTokens(cookie: string) {
+  const res = await request(authApp).get("/api/auth/list-sessions").set("origin", AUTH_ORIGIN).set("cookie", cookie);
+  expect(res.status).toBe(200);
+  return res.body as Array<{ id: string; token: string }>;
 }
 
 const tokenOf = (w: World) => ({ target: { token: w.keyA.token }, peer: { token: w.keyPeerA.token } });
@@ -204,9 +290,7 @@ describe("revocation during an in-flight upgrade (SEC-060)", () => {
     raceWss = setupLiveEventsWebSocketServer(raceServer, proxiedDb, {
       deploymentMode: "authenticated",
       resolveSessionFromHeaders: async (headers: Headers) => {
-        const userId = headers.get("x-test-user");
-        if (!userId) return null;
-        const session = { session: { id: headers.get("x-test-session") ?? `session-${userId}`, userId }, user: { id: userId, email: null, name: null } };
+        const session = await resolveBetterAuthSessionFromHeaders(auth, headers);
         // The session was valid when resolved; logout lands right after.
         const hook = gap.session;
         gap.session = null;
@@ -254,11 +338,12 @@ describe("revocation during an in-flight upgrade (SEC-060)", () => {
 
   it("a session logged out after resolution but before registration never streams", async () => {
     const w = await seedWorld(real.db);
+    const user = await signUp(w);
     gap.session = async () => {
-      const res = await send(real.app, { kind: "board", userId: w.users.member, sessionId: "race-s1" }, "post", "/api/auth/sign-out", {});
+      const res = await authPost("/api/auth/sign-out", user.cookie);
       expect(res.status).toBe(200);
     };
-    const client = await openRace(w.companyA.id, { "x-test-user": w.users.member, "x-test-session": "race-s1" });
+    const client = await openRace(w.companyA.id, { cookie: user.cookie });
     expect(gap.session).toBeNull();
     await expectClosed(client);
   });
@@ -432,15 +517,66 @@ describe("terminated is terminal under concurrency (SEC-060)", () => {
 });
 
 describe("board revocation closes live sockets", () => {
-  it("logout closes that session's socket only", async () => {
+  it("logout with a session cookie AND an invalid bearer header closes that session's socket only", async () => {
     const w = await seedWorld(real.db);
-    const s1 = await openTagged(w.companyA.id, { userId: w.users.member, sessionId: "s1" });
-    const s2 = await openTagged(w.companyA.id, { userId: w.users.member, sessionId: "s2" });
-    const res = await send(real.app, { kind: "board", userId: w.users.member, sessionId: "s1" }, "post", "/api/auth/sign-out", {});
+    const user = await signUp(w);
+    const second = await signIn(user.email);
+    const s1 = await openTagged(w.companyA.id, { cookie: user.cookie });
+    const s2 = await openTagged(w.companyA.id, { cookie: second });
+    const res = await authPost("/api/auth/sign-out", user.cookie, {}, { authorization: "Bearer not-a-real-key" });
     expect(res.status).toBe(200);
     await expectClosed(s1);
     await expectOpen(s2, w.companyA.id);
+    await expect(open(w.companyA.id, { cookie: user.cookie })).rejects.toThrow(/upgrade 403/);
     s2.ws.close();
+  });
+
+  it("revoke-session closes exactly the revoked session's socket", async () => {
+    const w = await seedWorld(real.db);
+    const user = await signUp(w);
+    const other = await signIn(user.email);
+    const target = await openTagged(w.companyA.id, { cookie: other });
+    const keeper = await openTagged(w.companyA.id, { cookie: user.cookie });
+    const sessions = await sessionTokens(user.cookie);
+    const otherToken = sessions.map((x) => x.token).find((t) => other.includes(t));
+    expect(otherToken).toBeTruthy();
+    const res = await authPost("/api/auth/revoke-session", user.cookie, { token: otherToken });
+    expect(res.status).toBe(200);
+    await expectClosed(target);
+    await expectOpen(keeper, w.companyA.id);
+    keeper.ws.close();
+  });
+
+  it("revoke-other-sessions closes every other session; the caller's stays", async () => {
+    const w = await seedWorld(real.db);
+    const user = await signUp(w);
+    const a = await signIn(user.email);
+    const b = await signIn(user.email);
+    const sa = await openTagged(w.companyA.id, { cookie: a });
+    const sb = await openTagged(w.companyA.id, { cookie: b });
+    const mine = await openTagged(w.companyA.id, { cookie: user.cookie });
+    const res = await authPost("/api/auth/revoke-other-sessions", user.cookie);
+    expect(res.status).toBe(200);
+    await expectClosed(sa);
+    await expectClosed(sb);
+    await expectOpen(mine, w.companyA.id);
+    mine.ws.close();
+  });
+
+  it("revoke-sessions (bulk) closes all of the user's sockets and leaves another user's open", async () => {
+    const w = await seedWorld(real.db);
+    const user = await signUp(w);
+    const second = await signIn(user.email);
+    const bystander = await signUp(w);
+    const s1 = await openTagged(w.companyA.id, { cookie: user.cookie });
+    const s2 = await openTagged(w.companyA.id, { cookie: second });
+    const control = await openTagged(w.companyA.id, { cookie: bystander.cookie });
+    const res = await authPost("/api/auth/revoke-sessions", user.cookie);
+    expect(res.status).toBe(200);
+    await expectClosed(s1);
+    await expectClosed(s2);
+    await expectOpen(control, w.companyA.id);
+    control.ws.close();
   });
 
   it("membership removal closes the user's socket and blocks reconnect", async () => {
