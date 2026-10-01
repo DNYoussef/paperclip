@@ -129,6 +129,18 @@ export function agentRoutes(db: Db) {
     throw forbidden("Only CEO or agent creators can modify other agents");
   }
 
+  // SEC-055: an existing budget only changes with board access to the agent's
+  // company, whichever route carries the change (PATCH, rollback, budgets).
+  function assertCanChangeBudget(
+    req: Request,
+    existing: { companyId: string; budgetMonthlyCents: number },
+    nextBudget: unknown,
+  ) {
+    if (nextBudget === undefined || nextBudget === existing.budgetMonthlyCents) return;
+    assertCompanyAccess(req, existing.companyId);
+    if (req.actor.type !== "board") throw forbidden("Board access required to change a budget");
+  }
+
   async function resolveCompanyIdForAgentReference(req: Request): Promise<string | null> {
     const companyIdQuery = req.query.companyId;
     const requestedCompanyId =
@@ -645,6 +657,17 @@ export function agentRoutes(db: Db) {
       return;
     }
     await assertCanUpdateAgent(req, existing);
+    const revision = await svc.getConfigRevision(id, revisionId);
+    if (!revision) {
+      res.status(404).json({ error: "Revision not found" });
+      return;
+    }
+    const revisionBudget = (revision.afterConfig as Record<string, unknown> | null)?.budgetMonthlyCents;
+    assertCanChangeBudget(
+      req,
+      existing,
+      typeof revisionBudget === "number" ? Math.max(0, Math.floor(revisionBudget)) : undefined,
+    );
 
     const actor = getActorInfo(req);
     const updated = await svc.rollbackConfigRevision(id, revisionId, {
@@ -1050,6 +1073,7 @@ export function agentRoutes(db: Db) {
       res.status(422).json({ error: "Use /api/agents/:id/permissions for permission changes" });
       return;
     }
+    assertCanChangeBudget(req, existing, (req.body as Record<string, unknown>).budgetMonthlyCents);
 
     const patchData = { ...(req.body as Record<string, unknown>) };
     if (Object.prototype.hasOwnProperty.call(patchData, "adapterConfig")) {

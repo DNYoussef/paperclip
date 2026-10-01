@@ -94,8 +94,9 @@ export function costRoutes(db: Db) {
   });
 
   router.patch("/agents/:agentId/budgets", validate(updateBudgetSchema), async (req, res) => {
-    // SEC-055: authenticate (401) before touching the agent, then authorize
-    // against the agent's company before any write.
+    // SEC-055: authenticate (401) before touching the agent, then require
+    // board access to the agent's company before any write. Agents never
+    // change budgets, including their own.
     const actor = getActorInfo(req);
     const agentId = req.params.agentId as string;
     const agent = await agents.getById(agentId);
@@ -104,15 +105,7 @@ export function costRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, agent.companyId);
-
-    if (req.actor.type === "agent") {
-      if (req.actor.agentId !== agentId) {
-        res.status(403).json({ error: "Agent can only change its own budget" });
-        return;
-      }
-    } else {
-      assertBoard(req);
-    }
+    assertBoard(req);
 
     const updated = await agents.update(agentId, { budgetMonthlyCents: req.body.budgetMonthlyCents });
     if (!updated) {
