@@ -890,7 +890,8 @@ export function issueRoutes(db: Db, storage: StorageService) {
         }
       }
 
-      if (runToInterrupt && runToInterrupt.status === "running") {
+      // SEC-056: never cancel a run of another company through a stored link.
+      if (runToInterrupt && runToInterrupt.status === "running" && runToInterrupt.companyId === currentIssue.companyId) {
         const cancelled = await heartbeat.cancelRun(runToInterrupt.id);
         if (cancelled) {
           interruptedRunId = cancelled.id;

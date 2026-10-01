@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { Request, RequestHandler } from "express";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentApiKeys, agents, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { agentApiKeys, agents, companyMemberships, heartbeatRuns, instanceUserRoles } from "@paperclipai/db";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
@@ -15,6 +15,30 @@ function hashToken(token: string) {
 interface ActorMiddlewareOptions {
   deploymentMode: DeploymentMode;
   resolveSession?: (req: Request) => Promise<BetterAuthSessionResult | null>;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// SEC-056: a caller-supplied run id (x-paperclip-run-id) is attribution and a
+// checkout lock key, so it is only accepted when the run belongs to the
+// authenticated agent (agents) or to a company the user can access (board).
+// Anything else is dropped before any route sees it.
+async function verifiedRunId(
+  db: Db,
+  runId: string | undefined | null,
+  owner: { agentId: string; companyId: string } | { companyIds: string[]; isInstanceAdmin: boolean },
+): Promise<string | undefined> {
+  if (!runId || !UUID_RE.test(runId)) return undefined;
+  const run = await db
+    .select({ agentId: heartbeatRuns.agentId, companyId: heartbeatRuns.companyId })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, runId))
+    .then((rows) => rows[0] ?? null);
+  if (!run) return undefined;
+  if ("agentId" in owner) {
+    return run.agentId === owner.agentId && run.companyId === owner.companyId ? runId : undefined;
+  }
+  return owner.isInstanceAdmin || owner.companyIds.includes(run.companyId) ? runId : undefined;
 }
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
@@ -57,19 +81,23 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
                 ),
               ),
           ]);
+          const companyIds = memberships.map((row) => row.companyId);
           req.actor = {
             type: "board",
             userId,
-            companyIds: memberships.map((row) => row.companyId),
+            companyIds,
             isInstanceAdmin: Boolean(roleRow),
-            runId: runIdHeader ?? undefined,
+            runId: await verifiedRunId(db, runIdHeader, { companyIds, isInstanceAdmin: Boolean(roleRow) }),
             source: "session",
           };
           next();
           return;
         }
       }
-      if (runIdHeader) req.actor.runId = runIdHeader;
+      if (runIdHeader && req.actor.type === "board") {
+        // local_trusted implicit board: every company is reachable.
+        req.actor.runId = await verifiedRunId(db, runIdHeader, { companyIds: [], isInstanceAdmin: true });
+      }
       next();
       return;
     }
@@ -115,7 +143,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         agentId: claims.sub,
         companyId: claims.company_id,
         keyId: undefined,
-        runId: runIdHeader || claims.run_id || undefined,
+        runId: await verifiedRunId(db, runIdHeader || claims.run_id, {
+          agentId: claims.sub,
+          companyId: claims.company_id,
+        }),
         source: "agent_jwt",
       };
       next();
@@ -143,7 +174,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       agentId: key.agentId,
       companyId: key.companyId,
       keyId: key.id,
-      runId: runIdHeader || undefined,
+      runId: await verifiedRunId(db, runIdHeader, { agentId: key.agentId, companyId: key.companyId }),
       source: "agent_key",
     };
 

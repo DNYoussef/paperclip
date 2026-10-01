@@ -340,3 +340,101 @@ describe("approval agent targets stay inside the approval company (SEC-056)", ()
     expect(otherKeys.every((k) => k.revokedAt === null)).toBe(true);
   });
 });
+
+describe("run links stay inside the issue company (SEC-056)", () => {
+  const runStatus = (id: string) =>
+    db().select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then((r) => r[0]!.status);
+  const foreignRun = (w: World) =>
+    db()
+      .insert(heartbeatRuns)
+      .values({ companyId: w.companyB.id, agentId: w.agentB.id, status: "running" })
+      .returning()
+      .then((r) => r[0]!);
+  const issueRunLinks = (id: string) =>
+    db()
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, id))
+      .then((r) => r[0]!);
+
+  it("checkout with a foreign run id header is refused and stores no run link", async () => {
+    const w = await seedWorld(db());
+    const runB = await foreignRun(w);
+    await db().update(issues).set({ assigneeAgentId: w.agentA.id, status: "todo" }).where(eq(issues.id, w.issueA.id));
+    const res = await send(
+      real.app,
+      w.callers.targetAgent,
+      "post",
+      `/api/issues/${w.issueA.id}/checkout`,
+      { agentId: w.agentA.id, expectedStatuses: ["todo"] },
+      { "x-paperclip-run-id": runB.id },
+    );
+    expect(res.status).toBe(401);
+    expect(await issueRunLinks(w.issueA.id)).toEqual({ checkoutRunId: null, executionRunId: null });
+  });
+
+  it("checkout with the agent's own run id stores that run", async () => {
+    const w = await seedWorld(db());
+    await db().update(issues).set({ assigneeAgentId: w.agentA.id, status: "todo" }).where(eq(issues.id, w.issueA.id));
+    const res = await send(
+      real.app,
+      w.callers.targetAgent,
+      "post",
+      `/api/issues/${w.issueA.id}/checkout`,
+      { agentId: w.agentA.id, expectedStatuses: ["todo"] },
+      { "x-paperclip-run-id": w.runA.id },
+    );
+    expect(res.status).toBe(200);
+    expect(await issueRunLinks(w.issueA.id)).toEqual({ checkoutRunId: w.runA.id, executionRunId: w.runA.id });
+  });
+
+  it("a peer agent's run id is not accepted as the caller's own", async () => {
+    const w = await seedWorld(db());
+    await db().update(issues).set({ assigneeAgentId: w.peerA.id, status: "todo" }).where(eq(issues.id, w.issueA.id));
+    const res = await send(
+      real.app,
+      w.callers.peerAgent,
+      "post",
+      `/api/issues/${w.issueA.id}/checkout`,
+      { agentId: w.peerA.id, expectedStatuses: ["todo"] },
+      { "x-paperclip-run-id": w.runA.id },
+    );
+    expect(res.status).toBe(401);
+    expect(await issueRunLinks(w.issueA.id)).toEqual({ checkoutRunId: null, executionRunId: null });
+  });
+
+  it("a stored foreign run link is neither disclosed nor cancelled", async () => {
+    const w = await seedWorld(db());
+    const runB = await foreignRun(w);
+    await db().update(issues).set({ executionRunId: runB.id, status: "in_progress" }).where(eq(issues.id, w.issueA.id));
+
+    const active = await send(real.app, w.callers.member, "get", `/api/issues/${w.issueA.id}/active-run`);
+    expect(active.status).toBe(200);
+    expect(active.body).toBeNull();
+
+    const list = await send(real.app, w.callers.member, "get", `/api/companies/${w.companyA.id}/issues`);
+    expect(list.status).toBe(200);
+    const listed = list.body.find((row: { id: string }) => row.id === w.issueA.id);
+    expect(listed.activeRun ?? null).toBeNull();
+
+    const comment = await send(real.app, w.callers.member, "post", `/api/issues/${w.issueA.id}/comments`, {
+      body: "stop",
+      interrupt: true,
+    });
+    expect(comment.status).toBe(201);
+    expect(await runStatus(runB.id)).toBe("running");
+  });
+
+  it("a same-company run link is shown and can be interrupted", async () => {
+    const w = await seedWorld(db());
+    await db().update(issues).set({ executionRunId: w.runA.id, status: "in_progress" }).where(eq(issues.id, w.issueA.id));
+    const active = await send(real.app, w.callers.member, "get", `/api/issues/${w.issueA.id}/active-run`);
+    expect(active.body?.id).toBe(w.runA.id);
+    const comment = await send(real.app, w.callers.member, "post", `/api/issues/${w.issueA.id}/comments`, {
+      body: "stop",
+      interrupt: true,
+    });
+    expect(comment.status).toBe(201);
+    expect(await runStatus(w.runA.id)).toBe("cancelled");
+  });
+});

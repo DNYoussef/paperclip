@@ -1613,7 +1613,8 @@ export function agentRoutes(db: Db) {
     assertCompanyAccess(req, issue.companyId);
 
     let run = issue.executionRunId ? await heartbeat.getRun(issue.executionRunId) : null;
-    if (run && run.status !== "queued" && run.status !== "running") {
+    // SEC-056: a stored run link is only expanded inside the issue's company.
+    if (run && (run.companyId !== issue.companyId || (run.status !== "queued" && run.status !== "running"))) {
       run = null;
     }
 
@@ -1621,7 +1622,7 @@ export function agentRoutes(db: Db) {
       const candidateRun = await heartbeat.getActiveRunForAgent(issue.assigneeAgentId);
       const candidateContext = asRecord(candidateRun?.contextSnapshot);
       const candidateIssueId = asNonEmptyString(candidateContext?.issueId);
-      if (candidateRun && candidateIssueId === issue.id) {
+      if (candidateRun && candidateIssueId === issue.id && candidateRun.companyId === issue.companyId) {
         run = candidateRun;
       }
     }

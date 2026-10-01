@@ -70,6 +70,7 @@ type IssueRow = typeof issues.$inferSelect;
 type IssueLabelRow = typeof labels.$inferSelect;
 type IssueActiveRunRow = {
   id: string;
+  companyId: string;
   status: string;
   agentId: string;
   invocationSource: string;
@@ -280,6 +281,7 @@ async function activeRunMapForIssues(
   const rows = await dbOrTx
     .select({
       id: heartbeatRuns.id,
+      companyId: heartbeatRuns.companyId,
       status: heartbeatRuns.status,
       agentId: heartbeatRuns.agentId,
       invocationSource: heartbeatRuns.invocationSource,
@@ -306,10 +308,11 @@ function withActiveRuns(
   issueRows: IssueWithLabels[],
   runMap: Map<string, IssueActiveRunRow>,
 ): IssueWithLabelsAndRun[] {
-  return issueRows.map((row) => ({
-    ...row,
-    activeRun: row.executionRunId ? (runMap.get(row.executionRunId) ?? null) : null,
-  }));
+  return issueRows.map((row) => {
+    const run = row.executionRunId ? (runMap.get(row.executionRunId) ?? null) : null;
+    // SEC-056: a stored run link is only expanded inside the issue's company.
+    return { ...row, activeRun: run && run.companyId === row.companyId ? run : null };
+  });
 }
 
 export function issueService(db: Db) {

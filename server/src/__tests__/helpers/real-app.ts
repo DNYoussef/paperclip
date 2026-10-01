@@ -63,8 +63,10 @@ export function send(
   method: "get" | "post" | "patch" | "delete",
   path: string,
   body?: unknown,
+  headers: Record<string, string> = {},
 ) {
   let req = request(app)[method](path);
+  for (const [name, value] of Object.entries(headers)) req = req.set(name, value);
   if (caller.kind === "board") {
     req = req.set("x-test-user", caller.userId).set("origin", "http://localhost:3100");
     if (caller.sessionId) req = req.set("x-test-session", caller.sessionId);
