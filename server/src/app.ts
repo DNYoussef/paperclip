@@ -83,6 +83,8 @@ export async function createApp(
         id: req.actor.userId,
         email: null,
         name: req.actor.source === "local_implicit" ? "Local Board" : null,
+        // SEC-066: lets the UI hide admin-only actions (company deletion).
+        isInstanceAdmin: req.actor.source === "local_implicit" || Boolean(req.actor.isInstanceAdmin),
       },
     });
   });

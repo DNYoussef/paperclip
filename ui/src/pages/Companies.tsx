@@ -5,6 +5,8 @@ import { useDialog } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { companiesApi } from "../api/companies";
 import { healthApi } from "../api/health";
+import { authApi } from "../api/auth";
+import { canDeleteCompanies } from "../lib/company-deletion";
 import { queryKeys } from "../lib/queryKeys";
 import { formatCents, relativeTime } from "../lib/utils";
 import { Input } from "@/components/ui/input";
@@ -45,13 +47,19 @@ export function Companies() {
     queryKey: queryKeys.companies.stats,
     queryFn: () => companiesApi.stats(),
   });
-  // SEC-066: the server refuses deletion unless the instance enabled it.
+  // SEC-066: the server refuses deletion unless the instance enabled it and
+  // the caller is an instance admin; the menu shows it only then.
   const { data: health } = useQuery({
     queryKey: queryKeys.health,
     queryFn: () => healthApi.get(),
     retry: false,
   });
-  const companyDeletionEnabled = health?.features?.companyDeletionEnabled === true;
+  const { data: session } = useQuery({
+    queryKey: queryKeys.auth.session,
+    queryFn: () => authApi.getSession(),
+    retry: false,
+  });
+  const companyDeletionEnabled = canDeleteCompanies(health, session);
 
   // Inline edit state
   const [editingId, setEditingId] = useState<string | null>(null);
