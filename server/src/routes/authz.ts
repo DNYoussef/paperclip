@@ -22,6 +22,15 @@ export function assertCompanyAccess(req: Request, companyId: string) {
   }
 }
 
+export function hasCompanyAccess(req: Request, companyId: string) {
+  try {
+    assertCompanyAccess(req, companyId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function getActorInfo(req: Request) {
   if (req.actor.type === "none") {
     throw unauthorized();

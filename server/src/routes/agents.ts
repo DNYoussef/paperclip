@@ -30,7 +30,7 @@ import {
   secretService,
 } from "../services/index.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
-import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { findServerAdapter, listAdapterModels } from "../adapters/index.js";
 import { redactEventPayload } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
@@ -588,13 +588,15 @@ export function agentRoutes(db: Db) {
   });
 
   router.get("/agents/:id", async (req, res) => {
+    // SEC-056: authenticate first (401); an agent outside the caller's
+    // companies is indistinguishable from a missing one (404).
+    getActorInfo(req);
     const id = req.params.id as string;
     const agent = await svc.getById(id);
-    if (!agent) {
+    if (!agent || !hasCompanyAccess(req, agent.companyId)) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    assertCompanyAccess(req, agent.companyId);
     if (req.actor.type === "agent" && req.actor.agentId !== id) {
       const canRead = await actorCanReadConfigurationsForCompany(req, agent.companyId);
       if (!canRead) {
