@@ -92,14 +92,14 @@ export function activityService(db: Db) {
         )
         .orderBy(desc(heartbeatRuns.createdAt)),
 
-    issuesForRun: async (runId: string) => {
+    issuesForRun: async (runId: string, companyId: string) => {
       const run = await db
         .select({
           companyId: heartbeatRuns.companyId,
           contextSnapshot: heartbeatRuns.contextSnapshot,
         })
         .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, runId))
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)))
         .then((rows) => rows[0] ?? null);
       if (!run) return [];
 
@@ -112,7 +112,7 @@ export function activityService(db: Db) {
           priority: issues.priority,
         })
         .from(activityLog)
-        .innerJoin(issues, eq(activityLog.entityId, issueIdAsText))
+        .innerJoin(issues, and(eq(activityLog.entityId, issueIdAsText), eq(issues.companyId, run.companyId)))
         .where(
           and(
             eq(activityLog.companyId, run.companyId),

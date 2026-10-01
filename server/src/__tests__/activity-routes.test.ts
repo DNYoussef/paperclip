@@ -23,6 +23,11 @@ vi.mock("../services/activity.js", () => ({
 
 vi.mock("../services/index.js", () => ({
   issueService: () => mockIssueService,
+  agentService: () => ({}),
+  projectService: () => ({}),
+  goalService: () => ({}),
+  approvalService: () => ({}),
+  heartbeatService: () => ({}),
 }));
 
 function createApp() {
