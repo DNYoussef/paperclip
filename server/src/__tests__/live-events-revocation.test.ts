@@ -41,7 +41,10 @@ beforeAll(async () => {
 }, 120_000);
 
 afterAll(async () => {
+  // Sockets a failing run left open must not hold the server open.
+  for (const client of (wss as any)?.clients ?? []) client.terminate();
   wss?.close();
+  server?.closeAllConnections();
   await new Promise<void>((resolve) => server?.close(() => resolve()));
   await real?.stop();
 });
