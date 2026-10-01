@@ -5,6 +5,7 @@ import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
 import { notifyHireApproved } from "./hire-hook.js";
+import { assertAgentsInCompany } from "./company-scoped-refs.js";
 
 function redactApprovalComment<T extends { body: string }>(comment: T): T {
   return {
@@ -30,6 +31,14 @@ export function approvalService(db: Db) {
     return existing;
   }
 
+  // SEC-056: the agents an approval acts on (hire_agent payload target, the
+  // requester woken on approval) must belong to the approval's company.
+  function approvalAgentRefs(type: string, payload: unknown, requestedByAgentId: string | null | undefined) {
+    const record = (payload ?? {}) as Record<string, unknown>;
+    const payloadAgentId = type === "hire_agent" && typeof record.agentId === "string" ? record.agentId : null;
+    return [payloadAgentId, requestedByAgentId];
+  }
+
   async function resolveApproval(
     id: string,
     targetStatus: "approved" | "rejected",
@@ -45,6 +54,11 @@ export function approvalService(db: Db) {
         `Only pending or revision requested approvals can be ${targetStatus === "approved" ? "approved" : "rejected"}`,
       );
     }
+    await assertAgentsInCompany(
+      db,
+      existing.companyId,
+      approvalAgentRefs(existing.type, existing.payload, existing.requestedByAgentId),
+    );
 
     const now = new Date();
     const updated = await db
@@ -88,12 +102,14 @@ export function approvalService(db: Db) {
         .where(eq(approvals.id, id))
         .then((rows) => rows[0] ?? null),
 
-    create: (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) =>
-      db
+    create: async (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) => {
+      await assertAgentsInCompany(db, companyId, approvalAgentRefs(data.type, data.payload, data.requestedByAgentId));
+      return db
         .insert(approvals)
         .values({ ...data, companyId })
         .returning()
-        .then((rows) => rows[0]),
+        .then((rows) => rows[0]);
+    },
 
     approve: async (id: string, decidedByUserId: string, decisionNote?: string | null) => {
       const { approval: updated, applied } = await resolveApproval(
@@ -195,6 +211,11 @@ export function approvalService(db: Db) {
       if (existing.status !== "revision_requested") {
         throw unprocessable("Only revision requested approvals can be resubmitted");
       }
+      await assertAgentsInCompany(
+        db,
+        existing.companyId,
+        approvalAgentRefs(existing.type, payload ?? existing.payload, existing.requestedByAgentId),
+      );
 
       const now = new Date();
       return db
