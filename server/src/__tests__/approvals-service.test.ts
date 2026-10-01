@@ -17,6 +17,12 @@ vi.mock("../services/hire-hook.js", () => ({
   notifyHireApproved: mockNotifyHireApproved,
 }));
 
+// The company check on approval targets runs against PostgreSQL in
+// cross-company-links.test.ts; this stub DB only models approval rows.
+vi.mock("../services/company-scoped-refs.js", () => ({
+  assertAgentsInCompany: vi.fn(async () => undefined),
+}));
+
 type ApprovalRecord = {
   id: string;
   companyId: string;

@@ -1,212 +1,226 @@
-import request from "supertest";
-import type { Router } from "express";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ACTORS, COMPANY, appWithActor, type ActorName } from "./helpers/route-actors.js";
+import { and, count, eq } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { activityLog, agentApiKeys, agents, approvals, companies, heartbeatRuns } from "@paperclipai/db";
+import { send, seedWorld, startRealApp, type Caller, type RealApp, type World } from "./helpers/real-app.js";
 
-// SEC-056 router-level matrix: every listed mutating or disclosing route is
-// exercised with an anonymous caller, an outsider board account, a former
-// member, a foreign-company agent key and an authorized member. Rejected
-// callers must not reach the service mutation.
+// SEC-056 router-level matrix over the real app and a real PostgreSQL. Each
+// case seeds a fresh world, then calls the route as: anonymous, an outsider
+// board account (member of company B only), a former member (membership
+// removed through accessService), a suspended member, a foreign-company agent
+// key, a same-company agent key, and an authorized member. Every rejected
+// call must leave the stored state unchanged; the authorized call must
+// succeed and (for mutations) change it.
 
-const mocks = vi.hoisted(() => {
-  const AGENT_ID = "11111111-1111-4111-8111-111111111111";
-  const agent = { id: AGENT_ID, companyId: "company-1", status: "active", budgetMonthlyCents: 100 };
-  const run = { id: "run-1", companyId: "company-1", agentId: AGENT_ID, status: "running" };
-  const approval = {
-    id: "approval-1",
-    companyId: "company-1",
-    type: "hire_agent",
-    status: "pending",
-    payload: {},
-    requestedByAgentId: null,
-  };
-  return {
-    AGENT_ID,
-    agents: {
-      getById: vi.fn(async (id: string) => (id === AGENT_ID ? { ...agent } : null)),
-      pause: vi.fn(async () => ({ ...agent, status: "paused" })),
-      resume: vi.fn(async () => ({ ...agent })),
-      terminate: vi.fn(async () => ({ ...agent, status: "terminated" })),
-      remove: vi.fn(async () => ({ ...agent })),
-      update: vi.fn(async (_id: string, patch: Record<string, unknown>) => ({ ...agent, ...patch })),
-      listKeys: vi.fn(async () => [{ id: "key-1", name: "k", createdAt: new Date(), revokedAt: null }]),
-      createApiKey: vi.fn(async () => ({ id: "key-1", name: "k", token: "redacted", createdAt: new Date() })),
-      revokeKey: vi.fn(async (agentId: string, keyId: string) =>
-        agentId === AGENT_ID && keyId === "key-1" ? { id: "key-1" } : null,
-      ),
-    },
-    heartbeat: {
-      getRun: vi.fn(async (id: string) => (id === "run-1" ? { ...run } : null)),
-      cancelRun: vi.fn(async () => ({ ...run, status: "cancelled" })),
-      cancelActiveForAgent: vi.fn(async () => undefined),
-      wakeup: vi.fn(async () => ({ id: "wake-1" })),
-    },
-    approvals: {
-      getById: vi.fn(async (id: string) => (id === "approval-1" ? { ...approval } : null)),
-      approve: vi.fn(async () => ({ approval: { ...approval, status: "approved" }, applied: true })),
-      reject: vi.fn(async () => ({ approval: { ...approval, status: "rejected" }, applied: true })),
-      requestRevision: vi.fn(async () => ({ ...approval, status: "revision_requested" })),
-    },
-    companies: {
-      update: vi.fn(async (id: string, patch: Record<string, unknown>) => ({ id, ...patch })),
-    },
-    activity: {
-      create: vi.fn(async (data: Record<string, unknown>) => ({ id: "evt-1", ...data })),
-      issuesForRun: vi.fn(async () => [{ issueId: "issue-1", title: "private" }]),
-      list: vi.fn(),
-      forIssue: vi.fn(),
-      runsForIssue: vi.fn(),
-    },
-    issues: {
-      getById: vi.fn(async () => null),
-      getByIdentifier: vi.fn(async () => null),
-    },
-    logActivity: vi.fn(async () => undefined),
-  };
+let real: RealApp;
+
+beforeAll(async () => {
+  real = await startRealApp();
+}, 120_000);
+
+afterAll(async () => {
+  await real?.stop();
 });
-
-const AGENT_ID = mocks.AGENT_ID;
-
-vi.mock("../services/index.js", () => ({
-  agentService: () => mocks.agents,
-  accessService: () => ({}),
-  approvalService: () => mocks.approvals,
-  heartbeatService: () => mocks.heartbeat,
-  issueApprovalService: () => ({ listIssuesForApproval: vi.fn(async () => []) }),
-  issueService: () => mocks.issues,
-  projectService: () => ({ getById: vi.fn(async () => null) }),
-  goalService: () => ({ getById: vi.fn(async () => null) }),
-  secretService: () => ({}),
-  costService: () => ({}),
-  companyService: () => mocks.companies,
-  logActivity: mocks.logActivity,
-}));
-
-vi.mock("../services/activity.js", () => ({
-  activityService: () => mocks.activity,
-}));
-
-const { agentRoutes } = await import("../routes/agents.js");
-const { approvalRoutes } = await import("../routes/approvals.js");
-const { costRoutes } = await import("../routes/costs.js");
-const { activityRoutes } = await import("../routes/activity.js");
 
 type Method = "get" | "post" | "patch" | "delete";
 
 interface RouteCase {
   name: string;
   method: Method;
-  path: string;
-  body?: Record<string, unknown>;
-  routes: () => Router;
-  sideEffect: () => { mock: { calls: unknown[][] } };
+  path: (w: World) => string;
+  body?: (w: World) => unknown;
+  // How a same-company agent key is treated: board-only routes refuse it.
+  agent: "forbidden" | "allowed";
+  // Status for a caller with no access to company A (default 403).
+  noAccessStatus?: number;
+  prepare?: (w: World) => Promise<void>;
+  // Stored state the route mutates; undefined for read-only routes.
+  state?: (w: World) => Promise<unknown>;
 }
+
+const db = () => real.db;
+
+const agentRow = (id: string) =>
+  db()
+    .select({ status: agents.status, budget: agents.budgetMonthlyCents, updatedAt: agents.updatedAt })
+    .from(agents)
+    .where(eq(agents.id, id))
+    .then((rows) => rows[0] ?? null);
 
 const CASES: RouteCase[] = [
-  { name: "POST /agents/:id/pause", method: "post", path: `/api/agents/${AGENT_ID}/pause`, routes: () => agentRoutes({} as any), sideEffect: () => mocks.agents.pause },
-  { name: "POST /agents/:id/resume", method: "post", path: `/api/agents/${AGENT_ID}/resume`, routes: () => agentRoutes({} as any), sideEffect: () => mocks.agents.resume },
-  { name: "POST /agents/:id/terminate", method: "post", path: `/api/agents/${AGENT_ID}/terminate`, routes: () => agentRoutes({} as any), sideEffect: () => mocks.agents.terminate },
-  { name: "DELETE /agents/:id", method: "delete", path: `/api/agents/${AGENT_ID}`, routes: () => agentRoutes({} as any), sideEffect: () => mocks.agents.remove },
-  { name: "GET /agents/:id/keys", method: "get", path: `/api/agents/${AGENT_ID}/keys`, routes: () => agentRoutes({} as any), sideEffect: () => mocks.agents.listKeys },
-  { name: "POST /agents/:id/keys", method: "post", path: `/api/agents/${AGENT_ID}/keys`, body: { name: "k" }, routes: () => agentRoutes({} as any), sideEffect: () => mocks.agents.createApiKey },
-  { name: "DELETE /agents/:id/keys/:keyId", method: "delete", path: `/api/agents/${AGENT_ID}/keys/key-1`, routes: () => agentRoutes({} as any), sideEffect: () => mocks.agents.revokeKey },
-  { name: "POST /heartbeat-runs/:runId/cancel", method: "post", path: "/api/heartbeat-runs/run-1/cancel", routes: () => agentRoutes({} as any), sideEffect: () => mocks.heartbeat.cancelRun },
-  { name: "POST /approvals/:id/approve", method: "post", path: "/api/approvals/approval-1/approve", body: {}, routes: () => approvalRoutes({} as any), sideEffect: () => mocks.approvals.approve },
-  { name: "POST /approvals/:id/reject", method: "post", path: "/api/approvals/approval-1/reject", body: {}, routes: () => approvalRoutes({} as any), sideEffect: () => mocks.approvals.reject },
-  { name: "POST /approvals/:id/request-revision", method: "post", path: "/api/approvals/approval-1/request-revision", body: {}, routes: () => approvalRoutes({} as any), sideEffect: () => mocks.approvals.requestRevision },
-  { name: "PATCH /companies/:companyId/budgets", method: "patch", path: `/api/companies/${COMPANY}/budgets`, body: { budgetMonthlyCents: 1 }, routes: () => costRoutes({} as any), sideEffect: () => mocks.companies.update },
-  { name: "PATCH /agents/:agentId/budgets", method: "patch", path: `/api/agents/${AGENT_ID}/budgets`, body: { budgetMonthlyCents: 1 }, routes: () => costRoutes({} as any), sideEffect: () => mocks.agents.update },
-  { name: "POST /companies/:companyId/activity", method: "post", path: `/api/companies/${COMPANY}/activity`, body: { action: "client.note", entityType: "company", entityId: COMPANY }, routes: () => activityRoutes({} as any), sideEffect: () => mocks.activity.create },
-  { name: "GET /heartbeat-runs/:runId/issues", method: "get", path: "/api/heartbeat-runs/run-1/issues", routes: () => activityRoutes({} as any), sideEffect: () => mocks.activity.issuesForRun },
+  { name: "POST /agents/:id/pause", method: "post", path: (w) => `/api/agents/${w.agentA.id}/pause`, agent: "forbidden", state: (w) => agentRow(w.agentA.id) },
+  { name: "POST /agents/:id/resume", method: "post", path: (w) => `/api/agents/${w.agentA.id}/resume`, agent: "forbidden", state: (w) => agentRow(w.agentA.id) },
+  { name: "POST /agents/:id/terminate", method: "post", path: (w) => `/api/agents/${w.agentA.id}/terminate`, agent: "forbidden", state: (w) => agentRow(w.agentA.id) },
+  { name: "DELETE /agents/:id", method: "delete", path: (w) => `/api/agents/${w.agentA.id}`, agent: "forbidden", state: (w) => agentRow(w.agentA.id) },
+  { name: "GET /agents/:id/keys", method: "get", path: (w) => `/api/agents/${w.agentA.id}/keys`, agent: "forbidden" },
+  {
+    name: "POST /agents/:id/keys",
+    method: "post",
+    path: (w) => `/api/agents/${w.agentA.id}/keys`,
+    body: () => ({ name: "new" }),
+    agent: "forbidden",
+    state: (w) => db().select({ n: count() }).from(agentApiKeys).where(eq(agentApiKeys.agentId, w.agentA.id)).then((r) => r[0]!.n),
+  },
+  {
+    name: "DELETE /agents/:id/keys/:keyId",
+    method: "delete",
+    path: (w) => `/api/agents/${w.agentA.id}/keys/${w.keyA.id}`,
+    agent: "forbidden",
+    state: (w) => db().select({ revokedAt: agentApiKeys.revokedAt }).from(agentApiKeys).where(eq(agentApiKeys.id, w.keyA.id)).then((r) => r[0]),
+  },
+  {
+    name: "POST /heartbeat-runs/:runId/cancel",
+    method: "post",
+    path: (w) => `/api/heartbeat-runs/${w.runA.id}/cancel`,
+    agent: "forbidden",
+    state: (w) => db().select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, w.runA.id)).then((r) => r[0]),
+  },
+  ...(["approve", "reject", "request-revision"] as const).map(
+    (action): RouteCase => ({
+      name: `POST /approvals/:id/${action}`,
+      method: "post",
+      path: (w) => `/api/approvals/${w.approvalA.id}/${action}`,
+      body: () => ({}),
+      agent: "forbidden",
+      state: (w) => db().select({ status: approvals.status }).from(approvals).where(eq(approvals.id, w.approvalA.id)).then((r) => r[0]),
+    }),
+  ),
+  {
+    name: "POST /approvals/:id/resubmit",
+    method: "post",
+    path: (w) => `/api/approvals/${w.approvalA.id}/resubmit`,
+    body: () => ({ payload: { plan: "v2" } }),
+    agent: "forbidden",
+    prepare: async (w) => {
+      await db().update(approvals).set({ status: "revision_requested" }).where(eq(approvals.id, w.approvalA.id));
+    },
+    state: (w) => db().select({ status: approvals.status, payload: approvals.payload }).from(approvals).where(eq(approvals.id, w.approvalA.id)).then((r) => r[0]),
+  },
+  {
+    name: "POST /companies/:companyId/approvals",
+    method: "post",
+    path: (w) => `/api/companies/${w.companyA.id}/approvals`,
+    body: () => ({ type: "approve_ceo_strategy", payload: { plan: "x" } }),
+    agent: "allowed",
+    state: (w) => db().select({ n: count() }).from(approvals).where(eq(approvals.companyId, w.companyA.id)).then((r) => r[0]!.n),
+  },
+  { name: "GET /approvals/:id", method: "get", path: (w) => `/api/approvals/${w.approvalA.id}`, agent: "allowed" },
+  {
+    name: "PATCH /companies/:companyId/budgets",
+    method: "patch",
+    path: (w) => `/api/companies/${w.companyA.id}/budgets`,
+    body: () => ({ budgetMonthlyCents: 777 }),
+    agent: "forbidden",
+    state: (w) => db().select({ budget: companies.budgetMonthlyCents }).from(companies).where(eq(companies.id, w.companyA.id)).then((r) => r[0]),
+  },
+  {
+    name: "PATCH /agents/:agentId/budgets",
+    method: "patch",
+    path: (w) => `/api/agents/${w.agentA.id}/budgets`,
+    body: () => ({ budgetMonthlyCents: 777 }),
+    agent: "forbidden",
+    state: (w) => agentRow(w.agentA.id),
+  },
+  {
+    name: "PATCH /agents/:id (budget)",
+    method: "patch",
+    path: (w) => `/api/agents/${w.agentA.id}`,
+    body: () => ({ budgetMonthlyCents: 777 }),
+    agent: "forbidden",
+    state: (w) => agentRow(w.agentA.id),
+  },
+  {
+    name: "POST /companies/:companyId/activity",
+    method: "post",
+    path: (w) => `/api/companies/${w.companyA.id}/activity`,
+    body: (w) => ({ action: "client.note", entityType: "company", entityId: w.companyA.id }),
+    agent: "forbidden",
+    state: (w) => db().select({ n: count() }).from(activityLog).where(eq(activityLog.companyId, w.companyA.id)).then((r) => r[0]!.n),
+  },
+  { name: "GET /heartbeat-runs/:runId/issues", method: "get", path: (w) => `/api/heartbeat-runs/${w.runA.id}/issues`, agent: "allowed" },
+  { name: "GET /agents/:id", method: "get", path: (w) => `/api/agents/${w.agentA.id}`, agent: "allowed", noAccessStatus: 404 },
 ];
 
-const REJECTED: Array<{ actor: ActorName; status: number }> = [
-  { actor: "anonymous", status: 401 },
-  { actor: "outsider", status: 403 },
-  { actor: "formerMember", status: 403 },
-  { actor: "foreignAgent", status: 403 },
-];
-
-async function call(actor: ActorName, c: RouteCase) {
-  const app = appWithActor(ACTORS[actor], c.routes());
-  const req = request(app)[c.method](c.path);
-  return c.body ? req.send(c.body) : req;
+async function snapshot(c: RouteCase, w: World) {
+  return c.state ? JSON.stringify(await c.state(w)) : null;
 }
 
-describe("company authorization matrix", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
+describe("company authorization matrix (real app, real database)", () => {
   for (const c of CASES) {
-    describe(c.name, () => {
-      for (const { actor, status } of REJECTED) {
-        it(`${actor} -> ${status} and no side effect`, async () => {
-          const res = await call(actor, c);
-          expect(res.status).toBe(status);
-          expect(c.sideEffect().mock.calls.length).toBe(0);
-        });
+    it(c.name, async () => {
+      const w = await seedWorld(db());
+      await c.prepare?.(w);
+      const before = await snapshot(c, w);
+      const noAccess = c.noAccessStatus ?? 403;
+
+      const rejected: Array<[string, Caller, number]> = [
+        ["anonymous", w.callers.anonymous, 401],
+        ["outsider", w.callers.outsider, noAccess],
+        ["formerMember", w.callers.formerMember, noAccess],
+        ["suspendedMember", w.callers.suspendedMember, noAccess],
+        ["foreignAgent", w.callers.foreignAgent, noAccess],
+      ];
+      if (c.agent === "forbidden") rejected.push(["sameCompanyAgent", w.callers.peerAgent, 403]);
+
+      for (const [label, caller, status] of rejected) {
+        const res = await send(real.app, caller, c.method, c.path(w), c.body?.(w));
+        expect({ label, status: res.status }).toEqual({ label, status });
+        expect({ label, state: await snapshot(c, w) }).toEqual({ label, state: before });
       }
 
-      it("member -> success and side effect", async () => {
-        const res = await call("member", c);
-        expect([200, 201]).toContain(res.status);
-        expect(c.sideEffect().mock.calls.length).toBe(1);
-      });
+      const allowed: Array<[string, Caller]> = [["member", w.callers.member]];
+      if (c.agent === "allowed") allowed.push(["sameCompanyAgent", w.callers.peerAgent]);
+      for (const [label, caller] of allowed) {
+        const res = await send(real.app, caller, c.method, c.path(w), c.body?.(w));
+        expect({ label, ok: [200, 201].includes(res.status), status: res.status }).toMatchObject({ label, ok: true });
+      }
+      if (c.state) expect(await snapshot(c, w)).not.toEqual(before);
     });
   }
-});
 
-describe("key revocation is scoped by (agentId, keyId)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+  it("GET /agents/:id: an outsider gets the same 404 for a foreign agent as for a missing one", async () => {
+    const w = await seedWorld(db());
+    const foreign = await send(real.app, w.callers.outsider, "get", `/api/agents/${w.agentA.id}`);
+    const missing = await send(real.app, w.callers.outsider, "get", "/api/agents/00000000-0000-4000-8000-000000000000");
+    expect(foreign.status).toBe(404);
+    expect(missing.status).toBe(404);
+    expect(foreign.body).toEqual(missing.body);
+    expect(JSON.stringify(foreign.body)).not.toContain(w.agentA.name);
   });
 
-  it("a keyId that does not belong to the agent is a 404", async () => {
-    const res = await request(appWithActor(ACTORS.member, agentRoutes({} as any))).delete(
-      `/api/agents/${AGENT_ID}/keys/key-foreign`,
-    );
+  it("DELETE /agents/:id/keys/:keyId: a key of another agent is a 404 and stays valid", async () => {
+    const w = await seedWorld(db());
+    const res = await send(real.app, w.callers.member, "delete", `/api/agents/${w.agentA.id}/keys/${w.keyPeerA.id}`);
     expect(res.status).toBe(404);
-    expect(mocks.agents.revokeKey).toHaveBeenCalledWith(AGENT_ID, "key-foreign");
+    const row = await db()
+      .select({ revokedAt: agentApiKeys.revokedAt })
+      .from(agentApiKeys)
+      .where(and(eq(agentApiKeys.id, w.keyPeerA.id)))
+      .then((r) => r[0]);
+    expect(row?.revokedAt).toBeNull();
   });
 });
 
 describe("approval decision attribution (SEC-058)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
   for (const action of ["approve", "reject", "request-revision"]) {
-    it(`${action}: a body carrying decidedByUserId is rejected`, async () => {
-      const res = await request(appWithActor(ACTORS.member, approvalRoutes({} as any)))
-        .post(`/api/approvals/approval-1/${action}`)
-        .send({ decidedByUserId: "victim-user" });
+    it(`${action}: a body carrying decidedByUserId is rejected and nothing changes`, async () => {
+      const w = await seedWorld(db());
+      const res = await send(real.app, w.callers.member, "post", `/api/approvals/${w.approvalA.id}/${action}`, {
+        decidedByUserId: "victim-user",
+      });
       expect(res.status).toBe(400);
-      expect(mocks.approvals.approve).not.toHaveBeenCalled();
-      expect(mocks.approvals.reject).not.toHaveBeenCalled();
-      expect(mocks.approvals.requestRevision).not.toHaveBeenCalled();
+      const row = await db().select().from(approvals).where(eq(approvals.id, w.approvalA.id)).then((r) => r[0]!);
+      expect(row.status).toBe("pending");
+      expect(row.decidedByUserId).toBeNull();
+    });
+
+    it(`${action}: records the authenticated user`, async () => {
+      const w = await seedWorld(db());
+      const res = await send(real.app, w.callers.member, "post", `/api/approvals/${w.approvalA.id}/${action}`, {
+        decisionNote: "ok",
+      });
+      expect(res.status).toBe(200);
+      const row = await db().select().from(approvals).where(eq(approvals.id, w.approvalA.id)).then((r) => r[0]!);
+      expect(row.decidedByUserId).toBe(w.users.member);
     });
   }
-
-  it("approve records the authenticated user", async () => {
-    const res = await request(appWithActor(ACTORS.member, approvalRoutes({} as any)))
-      .post("/api/approvals/approval-1/approve")
-      .send({ decisionNote: "ok" });
-    expect(res.status).toBe(200);
-    expect(mocks.approvals.approve).toHaveBeenCalledWith("approval-1", "member-user", "ok");
-  });
-
-  it("reject records the authenticated user", async () => {
-    await request(appWithActor(ACTORS.member, approvalRoutes({} as any)))
-      .post("/api/approvals/approval-1/reject")
-      .send({});
-    expect(mocks.approvals.reject).toHaveBeenCalledWith("approval-1", "member-user", undefined);
-  });
-
-  it("request-revision records the authenticated user", async () => {
-    await request(appWithActor(ACTORS.member, approvalRoutes({} as any)))
-      .post("/api/approvals/approval-1/request-revision")
-      .send({});
-    expect(mocks.approvals.requestRevision).toHaveBeenCalledWith("approval-1", "member-user", undefined);
-  });
 });

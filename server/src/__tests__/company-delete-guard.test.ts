@@ -1,75 +1,64 @@
-import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { companyRoutes } from "../routes/companies.js";
-import { ACTORS, COMPANY, appWithActor } from "./helpers/route-actors.js";
+import type express from "express";
+import { eq } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { companies } from "@paperclipai/db";
+import { buildApp, send, seedWorld, startRealApp, type RealApp } from "./helpers/real-app.js";
 
-// SEC-066: companyDeletionEnabled must gate DELETE /companies/:companyId,
-// and even when enabled only an instance admin may hard-delete.
-const mockCompanyService = vi.hoisted(() => ({
-  list: vi.fn(),
-  stats: vi.fn(),
-  getById: vi.fn(),
-  create: vi.fn(),
-  update: vi.fn(),
-  archive: vi.fn(),
-  remove: vi.fn(async (id: string) => ({ id })),
-}));
+// SEC-066: companyDeletionEnabled gates DELETE /companies/:companyId, and even
+// when enabled only an instance admin may hard-delete. The disabled-flag app
+// and the enabled-flag app share one real database.
 
-vi.mock("../services/index.js", () => ({
-  companyService: () => mockCompanyService,
-  companyPortabilityService: () => ({}),
-  accessService: () => ({ ensureMembership: vi.fn() }),
-  logActivity: vi.fn(async () => undefined),
-}));
+let disabled: RealApp;
+let enabled: express.Express;
 
-vi.mock("../services/live-events.js", () => ({
-  closeLiveEventsConnections: vi.fn(),
-}));
+beforeAll(async () => {
+  disabled = await startRealApp({ companyDeletionEnabled: false });
+  enabled = await buildApp(disabled.db, { companyDeletionEnabled: true });
+}, 120_000);
 
-function app(actor: (typeof ACTORS)[keyof typeof ACTORS], companyDeletionEnabled: boolean) {
-  return appWithActor(actor, companyRoutes({} as any, { companyDeletionEnabled }), "/api/companies");
-}
+afterAll(async () => {
+  await disabled?.stop();
+});
+
+const exists = (id: string) =>
+  disabled.db.select({ id: companies.id }).from(companies).where(eq(companies.id, id)).then((r) => r.length === 1);
 
 describe("DELETE /companies/:companyId guard (SEC-066)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
   it("flag false: an authorized member gets 403 and no DB mutation", async () => {
-    const res = await request(app(ACTORS.member, false)).delete(`/api/companies/${COMPANY}`);
+    const w = await seedWorld(disabled.db);
+    const res = await send(disabled.app, w.callers.member, "delete", `/api/companies/${w.companyA.id}`);
     expect(res.status).toBe(403);
-    expect(mockCompanyService.remove).not.toHaveBeenCalled();
+    expect(await exists(w.companyA.id)).toBe(true);
   });
 
   it("flag false: an instance admin is refused too", async () => {
-    const res = await request(app(ACTORS.instanceAdmin, false)).delete(`/api/companies/${COMPANY}`);
+    const w = await seedWorld(disabled.db);
+    const res = await send(disabled.app, w.callers.instanceAdmin, "delete", `/api/companies/${w.companyA.id}`);
     expect(res.status).toBe(403);
-    expect(mockCompanyService.remove).not.toHaveBeenCalled();
+    expect(await exists(w.companyA.id)).toBe(true);
   });
 
-  it("flag true: a non-admin member is still refused", async () => {
-    const res = await request(app(ACTORS.member, true)).delete(`/api/companies/${COMPANY}`);
-    expect(res.status).toBe(403);
-    expect(mockCompanyService.remove).not.toHaveBeenCalled();
-  });
-
-  it("flag true: an outsider is refused", async () => {
-    const res = await request(app(ACTORS.outsider, true)).delete(`/api/companies/${COMPANY}`);
-    expect(res.status).toBe(403);
-    expect(mockCompanyService.remove).not.toHaveBeenCalled();
+  it("flag true: a non-admin member, an outsider and an agent are still refused", async () => {
+    const w = await seedWorld(disabled.db);
+    for (const caller of [w.callers.member, w.callers.outsider, w.callers.peerAgent]) {
+      const res = await send(enabled, caller, "delete", `/api/companies/${w.companyA.id}`);
+      expect(res.status).toBe(403);
+    }
+    expect(await exists(w.companyA.id)).toBe(true);
   });
 
   it("flag true: an instance admin deletes", async () => {
-    const res = await request(app(ACTORS.instanceAdmin, true)).delete(`/api/companies/${COMPANY}`);
+    const w = await seedWorld(disabled.db);
+    const res = await send(enabled, w.callers.instanceAdmin, "delete", `/api/companies/${w.companyA.id}`);
     expect(res.status).toBe(200);
-    expect(mockCompanyService.remove).toHaveBeenCalledWith(COMPANY);
+    expect(await exists(w.companyA.id)).toBe(false);
   });
 
-  it("omitted options default to deletion disabled", async () => {
-    const res = await request(
-      appWithActor(ACTORS.instanceAdmin, companyRoutes({} as any), "/api/companies"),
-    ).delete(`/api/companies/${COMPANY}`);
-    expect(res.status).toBe(403);
-    expect(mockCompanyService.remove).not.toHaveBeenCalled();
+  it("get-session tells the UI whether the caller is an instance admin", async () => {
+    const w = await seedWorld(disabled.db);
+    const member = await send(enabled, w.callers.member, "get", "/api/auth/get-session");
+    const admin = await send(enabled, w.callers.instanceAdmin, "get", "/api/auth/get-session");
+    expect(member.body.user.isInstanceAdmin).toBe(false);
+    expect(admin.body.user.isInstanceAdmin).toBe(true);
   });
 });

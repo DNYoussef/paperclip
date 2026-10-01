@@ -1,142 +1,105 @@
-import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { activityRoutes } from "../routes/activity.js";
-import { ACTORS, COMPANY, OTHER_COMPANY, appWithActor } from "./helpers/route-actors.js";
+import { eq } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { activityLog } from "@paperclipai/db";
+import { send, seedWorld, startRealApp, type RealApp, type World } from "./helpers/real-app.js";
 
-// SEC-071: POST /companies/:companyId/activity must derive actorType and
-// actorId from the authenticated actor, accept only client.* actions and
-// only entities owned by the company.
-const mockActivityService = vi.hoisted(() => ({
-  list: vi.fn(),
-  forIssue: vi.fn(),
-  runsForIssue: vi.fn(),
-  issuesForRun: vi.fn(),
-  create: vi.fn(async (data: Record<string, unknown>) => ({ id: "evt-1", ...data })),
-}));
+// SEC-071: client-reported activity is attributed to the authenticated actor,
+// reserved server action names are refused, and the entity must belong to the
+// path company. Every refusal asserts nothing was persisted.
 
-const mockIssueService = vi.hoisted(() => ({
-  getById: vi.fn(async (id: string) =>
-    id === "issue-own"
-      ? { id, companyId: "company-1" }
-      : id === "issue-foreign"
-        ? { id, companyId: "company-other" }
-        : null,
-  ),
-  getByIdentifier: vi.fn(),
-}));
+let real: RealApp;
 
-vi.mock("../services/activity.js", () => ({
-  activityService: () => mockActivityService,
-}));
+beforeAll(async () => {
+  real = await startRealApp();
+}, 120_000);
 
-vi.mock("../services/index.js", () => ({
-  issueService: () => mockIssueService,
-  agentService: () => ({ getById: vi.fn(async () => null) }),
-  projectService: () => ({ getById: vi.fn(async () => null) }),
-  goalService: () => ({ getById: vi.fn(async () => null) }),
-  approvalService: () => ({ getById: vi.fn(async () => null) }),
-  heartbeatService: () => ({ getRun: vi.fn() }),
-}));
+afterAll(async () => {
+  await real?.stop();
+});
 
-function app(actor: (typeof ACTORS)[keyof typeof ACTORS]) {
-  return appWithActor(actor, activityRoutes({} as any));
-}
-
-const url = `/api/companies/${COMPANY}/activity`;
+const url = (w: World) => `/api/companies/${w.companyA.id}/activity`;
+const rowsFor = (w: World) => real.db.select().from(activityLog).where(eq(activityLog.companyId, w.companyA.id));
 
 describe("POST /companies/:companyId/activity attribution (SEC-071)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
   it("rejects a body that supplies actorId or actorType", async () => {
-    const res = await request(app(ACTORS.member)).post(url).send({
+    const w = await seedWorld(real.db);
+    const res = await send(real.app, w.callers.member, "post", url(w), {
       actorType: "system",
       actorId: "victim-user",
       action: "client.note",
       entityType: "issue",
-      entityId: "issue-own",
+      entityId: w.issueA.id,
     });
     expect(res.status).toBe(400);
-    expect(mockActivityService.create).not.toHaveBeenCalled();
+    expect(await rowsFor(w)).toHaveLength(0);
   });
 
-  it("rejects a reserved server action name", async () => {
+  it("rejects reserved server action names", async () => {
+    const w = await seedWorld(real.db);
     for (const action of ["approval.approved", "company.deleted", "agent.terminated"]) {
-      const res = await request(app(ACTORS.member)).post(url).send({
+      const res = await send(real.app, w.callers.member, "post", url(w), {
         action,
         entityType: "issue",
-        entityId: "issue-own",
+        entityId: w.issueA.id,
       });
       expect(res.status).toBe(400);
     }
-    expect(mockActivityService.create).not.toHaveBeenCalled();
+    expect(await rowsFor(w)).toHaveLength(0);
   });
 
-  it("rejects an entity owned by another company", async () => {
-    const res = await request(app(ACTORS.member)).post(url).send({
-      action: "client.note",
-      entityType: "issue",
-      entityId: "issue-foreign",
-    });
-    expect(res.status).toBe(404);
-    expect(mockActivityService.create).not.toHaveBeenCalled();
+  it("rejects an existing entity owned by another company", async () => {
+    const w = await seedWorld(real.db);
+    for (const [entityType, entityId] of [
+      ["issue", w.issueB.id],
+      ["agent", w.agentB.id],
+      ["project", w.projectB.id],
+      ["goal", w.goalB.id],
+      ["company", w.companyB.id],
+    ]) {
+      const res = await send(real.app, w.callers.member, "post", url(w), { action: "client.note", entityType, entityId });
+      expect({ entityType, status: res.status }).toEqual({ entityType, status: 404 });
+    }
+    expect(await rowsFor(w)).toHaveLength(0);
   });
 
   it("rejects an unknown entity type", async () => {
-    const res = await request(app(ACTORS.member)).post(url).send({
+    const w = await seedWorld(real.db);
+    const res = await send(real.app, w.callers.member, "post", url(w), {
       action: "client.note",
       entityType: "secret",
       entityId: "secret-1",
     });
     expect(res.status).toBe(400);
-    expect(mockActivityService.create).not.toHaveBeenCalled();
+    expect(await rowsFor(w)).toHaveLength(0);
   });
 
-  it("outsider board account gets 403", async () => {
-    const res = await request(app(ACTORS.outsider)).post(url).send({
-      action: "client.note",
-      entityType: "company",
-      entityId: COMPANY,
-    });
-    expect(res.status).toBe(403);
-    expect(mockActivityService.create).not.toHaveBeenCalled();
-  });
-
-  it("anonymous caller gets 401", async () => {
-    const res = await request(app(ACTORS.anonymous)).post(url).send({
-      action: "client.note",
-      entityType: "company",
-      entityId: COMPANY,
-    });
-    expect(res.status).toBe(401);
-    expect(mockActivityService.create).not.toHaveBeenCalled();
-  });
-
-  it("company entity must be the path company", async () => {
-    const res = await request(app(ACTORS.member)).post(url).send({
-      action: "client.note",
-      entityType: "company",
-      entityId: OTHER_COMPANY,
-    });
-    expect(res.status).toBe(404);
-    expect(mockActivityService.create).not.toHaveBeenCalled();
+  it("anonymous, outsider and former member are refused", async () => {
+    const w = await seedWorld(real.db);
+    const body = { action: "client.note", entityType: "company", entityId: w.companyA.id };
+    expect((await send(real.app, w.callers.anonymous, "post", url(w), body)).status).toBe(401);
+    expect((await send(real.app, w.callers.outsider, "post", url(w), body)).status).toBe(403);
+    expect((await send(real.app, w.callers.formerMember, "post", url(w), body)).status).toBe(403);
+    expect(await rowsFor(w)).toHaveLength(0);
   });
 
   it("persists the authenticated actor, never the body", async () => {
-    const res = await request(app(ACTORS.member)).post(url).send({
+    const w = await seedWorld(real.db);
+    const res = await send(real.app, w.callers.member, "post", url(w), {
       action: "client.note",
       entityType: "issue",
-      entityId: "issue-own",
+      entityId: w.issueA.id,
       details: { text: "hello" },
     });
     expect(res.status).toBe(201);
-    expect(mockActivityService.create).toHaveBeenCalledTimes(1);
-    const persisted = mockActivityService.create.mock.calls[0][0] as Record<string, unknown>;
-    expect(persisted.companyId).toBe(COMPANY);
-    expect(persisted.actorType).toBe("user");
-    expect(persisted.actorId).toBe("member-user");
-    expect(persisted.action).toBe("client.note");
-    expect(persisted.agentId).toBeNull();
+    const rows = await rowsFor(w);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      actorType: "user",
+      actorId: w.users.member,
+      action: "client.note",
+      entityType: "issue",
+      entityId: w.issueA.id,
+      agentId: null,
+    });
   });
 });

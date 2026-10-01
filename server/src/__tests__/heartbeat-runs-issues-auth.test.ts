@@ -1,84 +1,69 @@
-import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { activityRoutes } from "../routes/activity.js";
-import { ACTORS, COMPANY, appWithActor } from "./helpers/route-actors.js";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { activityLog } from "@paperclipai/db";
+import { send, seedWorld, startRealApp, type RealApp, type World } from "./helpers/real-app.js";
 
-// SEC-056 (grown): GET /heartbeat-runs/:runId/issues leaked issue metadata
-// to anonymous callers. It must 401 for type none, 404 for an unknown run,
-// 403 for an outsider, and only then query the issues.
-const mockActivityService = vi.hoisted(() => ({
-  list: vi.fn(),
-  forIssue: vi.fn(),
-  runsForIssue: vi.fn(),
-  issuesForRun: vi.fn(async () => [
-    { issueId: "issue-1", identifier: "PAP-1", title: "private title", status: "todo", priority: "high" },
-  ]),
-  create: vi.fn(),
-}));
+// SEC-056 (grown): GET /api/heartbeat-runs/:runId/issues authenticates (401),
+// authorizes against the run's company, and joins only that company's issues.
 
-const mockHeartbeatService = vi.hoisted(() => ({
-  getRun: vi.fn(async (runId: string) =>
-    runId === "run-1" ? { id: "run-1", companyId: "company-1", agentId: "agent-1" } : null,
-  ),
-}));
+let real: RealApp;
 
-vi.mock("../services/activity.js", () => ({
-  activityService: () => mockActivityService,
-}));
+beforeAll(async () => {
+  real = await startRealApp();
+}, 120_000);
 
-vi.mock("../services/index.js", () => ({
-  issueService: () => ({ getById: vi.fn(), getByIdentifier: vi.fn() }),
-  agentService: () => ({ getById: vi.fn() }),
-  projectService: () => ({ getById: vi.fn() }),
-  goalService: () => ({ getById: vi.fn() }),
-  approvalService: () => ({ getById: vi.fn() }),
-  heartbeatService: () => mockHeartbeatService,
-}));
+afterAll(async () => {
+  await real?.stop();
+});
 
-function app(actor: (typeof ACTORS)[keyof typeof ACTORS]) {
-  return appWithActor(actor, activityRoutes({} as any));
+async function worldWithRunActivity() {
+  const w = await seedWorld(real.db);
+  // The run touched issue A; a corrupt row in company A also points at
+  // company B's issue. Neither may leak to an unauthorized caller, and the
+  // foreign issue may never be returned at all.
+  await real.db.insert(activityLog).values([
+    { companyId: w.companyA.id, actorType: "agent", actorId: w.agentA.id, action: "issue.updated", entityType: "issue", entityId: w.issueA.id, runId: w.runA.id },
+    { companyId: w.companyA.id, actorType: "agent", actorId: w.agentA.id, action: "issue.updated", entityType: "issue", entityId: w.issueB.id, runId: w.runA.id },
+  ]);
+  return w;
 }
 
-describe("GET /heartbeat-runs/:runId/issues authorization", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
+const path = (w: World) => `/api/heartbeat-runs/${w.runA.id}/issues`;
 
-  it("anonymous caller gets 401 and no issue query", async () => {
-    const res = await request(app(ACTORS.anonymous)).get("/api/heartbeat-runs/run-1/issues");
+describe("GET /heartbeat-runs/:runId/issues authorization", () => {
+  it("anonymous caller gets 401 and no issue metadata", async () => {
+    const w = await worldWithRunActivity();
+    const res = await send(real.app, w.callers.anonymous, "get", path(w));
     expect(res.status).toBe(401);
-    expect(mockActivityService.issuesForRun).not.toHaveBeenCalled();
-    expect(JSON.stringify(res.body)).not.toContain("private title");
+    expect(JSON.stringify(res.body)).not.toContain(w.issueA.title);
   });
 
   it("anonymous caller gets 401 even for an unknown run", async () => {
-    const res = await request(app(ACTORS.anonymous)).get("/api/heartbeat-runs/nope/issues");
+    const res = await send(real.app, { kind: "anonymous" }, "get", "/api/heartbeat-runs/00000000-0000-4000-8000-000000000000/issues");
     expect(res.status).toBe(401);
-    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
   });
 
-  it("outsider board account gets 403 and no issue query", async () => {
-    const res = await request(app(ACTORS.outsider)).get("/api/heartbeat-runs/run-1/issues");
-    expect(res.status).toBe(403);
-    expect(mockActivityService.issuesForRun).not.toHaveBeenCalled();
-  });
-
-  it("foreign-company agent key gets 403", async () => {
-    const res = await request(app(ACTORS.foreignAgent)).get("/api/heartbeat-runs/run-1/issues");
-    expect(res.status).toBe(403);
-    expect(mockActivityService.issuesForRun).not.toHaveBeenCalled();
+  it("outsider, former member and foreign agent get 403 and no issue metadata", async () => {
+    const w = await worldWithRunActivity();
+    for (const caller of [w.callers.outsider, w.callers.formerMember, w.callers.foreignAgent]) {
+      const res = await send(real.app, caller, "get", path(w));
+      expect(res.status).toBe(403);
+      expect(JSON.stringify(res.body)).not.toContain(w.issueA.title);
+    }
   });
 
   it("member gets 404 for an unknown run", async () => {
-    const res = await request(app(ACTORS.member)).get("/api/heartbeat-runs/nope/issues");
+    const w = await seedWorld(real.db);
+    const res = await send(real.app, w.callers.member, "get", "/api/heartbeat-runs/00000000-0000-4000-8000-000000000000/issues");
     expect(res.status).toBe(404);
-    expect(mockActivityService.issuesForRun).not.toHaveBeenCalled();
   });
 
-  it("member reads the issues of a run in their company", async () => {
-    const res = await request(app(ACTORS.member)).get("/api/heartbeat-runs/run-1/issues");
-    expect(res.status).toBe(200);
-    expect(mockActivityService.issuesForRun).toHaveBeenCalledWith("run-1", COMPANY);
-    expect(res.body[0].title).toBe("private title");
+  it("member and same-company agent read the run's own-company issues only", async () => {
+    const w = await worldWithRunActivity();
+    for (const caller of [w.callers.member, w.callers.peerAgent]) {
+      const res = await send(real.app, caller, "get", path(w));
+      expect(res.status).toBe(200);
+      expect(res.body.map((row: { issueId: string }) => row.issueId)).toEqual([w.issueA.id]);
+      expect(JSON.stringify(res.body)).not.toContain(w.issueB.title);
+    }
   });
 });

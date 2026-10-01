@@ -1,130 +1,310 @@
-import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { goals, issues, projects } from "@paperclipai/db";
-import { assertGoalsInCompany, assertIssueRefsInCompany } from "../services/company-scoped-refs.js";
-import { ACTORS, COMPANY, OTHER_COMPANY, appWithActor } from "./helpers/route-actors.js";
+import { and, eq } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  activityLog,
+  agentApiKeys,
+  agents,
+  approvals,
+  heartbeatRuns,
+  issues,
+  projectGoals,
+  projectWorkspaces,
+  projects,
+} from "@paperclipai/db";
+import { send, seedWorld, startRealApp, type RealApp, type World } from "./helpers/real-app.js";
 
-// SEC-062: issue and project relationships must stay inside one company.
-// Write side: the reference checks used by the issue and project services.
-// Read side: GET /issues/:id returns no foreign project or goal.
+// SEC-062 / SEC-056: records in company A may only reference company A rows.
+// Every case uses EXISTING company B rows (never missing ids), runs the real
+// routes and services against PostgreSQL, and checks both the response and
+// the stored state. Read cases plant deliberately inconsistent links.
 
-function fakeDb(rowsByTable: Map<unknown, Array<{ id: string }>>) {
-  const select = vi.fn(() => ({
-    from: (table: unknown) => ({
-      where: () => Promise.resolve(rowsByTable.get(table) ?? []),
-    }),
-  }));
-  return { db: { select } as any, select };
-}
+let real: RealApp;
 
-describe("assertIssueRefsInCompany", () => {
-  it("rejects a project from another company", async () => {
-    const { db } = fakeDb(new Map([[goals, [{ id: "g" }]], [issues, [{ id: "p" }]]]));
-    await expect(
-      assertIssueRefsInCompany(db, COMPANY, { projectId: "proj-foreign", goalId: "g", parentId: "p" }),
-    ).rejects.toMatchObject({ status: 404, message: "Project not found" });
-  });
+beforeAll(async () => {
+  real = await startRealApp();
+}, 120_000);
 
-  it("rejects a goal from another company", async () => {
-    const { db } = fakeDb(new Map([[projects, [{ id: "pr" }]], [issues, [{ id: "p" }]]]));
-    await expect(
-      assertIssueRefsInCompany(db, COMPANY, { projectId: "pr", goalId: "goal-foreign", parentId: "p" }),
-    ).rejects.toMatchObject({ status: 404, message: "Goal not found" });
-  });
+afterAll(async () => {
+  await real?.stop();
+});
 
-  it("rejects a parent issue from another company", async () => {
-    const { db } = fakeDb(new Map([[projects, [{ id: "pr" }]], [goals, [{ id: "g" }]]]));
-    await expect(
-      assertIssueRefsInCompany(db, COMPANY, { parentId: "issue-foreign" }),
-    ).rejects.toMatchObject({ status: 404, message: "Parent issue not found" });
-  });
+const db = () => real.db;
+const issueCount = (w: World) =>
+  db().select({ id: issues.id }).from(issues).where(eq(issues.companyId, w.companyA.id)).then((r) => r.length);
+const projectCount = (w: World) =>
+  db().select({ id: projects.id }).from(projects).where(eq(projects.companyId, w.companyA.id)).then((r) => r.length);
 
-  it("accepts same-company references and skips absent ones", async () => {
-    const { db, select } = fakeDb(new Map([[projects, [{ id: "pr" }]], [goals, [{ id: "g" }]], [issues, [{ id: "p" }]]]));
-    await expect(
-      assertIssueRefsInCompany(db, COMPANY, { projectId: "pr", goalId: "g", parentId: "p" }),
-    ).resolves.toBeUndefined();
-    expect(select).toHaveBeenCalledTimes(3);
+describe("issue create/update rejects foreign references", () => {
+  for (const ref of ["projectId", "goalId", "parentId"] as const) {
+    it(`create with a foreign ${ref} -> 404 and no issue`, async () => {
+      const w = await seedWorld(db());
+      const foreign = { projectId: w.projectB.id, goalId: w.goalB.id, parentId: w.issueB.id }[ref];
+      const before = await issueCount(w);
+      const res = await send(real.app, w.callers.member, "post", `/api/companies/${w.companyA.id}/issues`, {
+        title: "probe",
+        [ref]: foreign,
+      });
+      expect(res.status).toBe(404);
+      expect(await issueCount(w)).toBe(before);
+    });
 
-    select.mockClear();
-    await expect(assertIssueRefsInCompany(db, COMPANY, { projectId: null, goalId: undefined })).resolves.toBeUndefined();
-    expect(select).not.toHaveBeenCalled();
+    it(`update with a foreign ${ref} -> 404 and the stored link is unchanged`, async () => {
+      const w = await seedWorld(db());
+      const foreign = { projectId: w.projectB.id, goalId: w.goalB.id, parentId: w.issueB.id }[ref];
+      const res = await send(real.app, w.callers.member, "patch", `/api/issues/${w.issueA.id}`, { [ref]: foreign });
+      expect(res.status).toBe(404);
+      const row = await db().select().from(issues).where(eq(issues.id, w.issueA.id)).then((r) => r[0]!);
+      expect(row[ref]).toBeNull();
+    });
+  }
+
+  it("same-company references are accepted by a member and by a same-company agent", async () => {
+    const w = await seedWorld(db());
+    for (const caller of [w.callers.member, w.callers.peerAgent]) {
+      const res = await send(real.app, caller, "post", `/api/companies/${w.companyA.id}/issues`, {
+        title: "ok",
+        projectId: w.projectA.id,
+        goalId: w.goalA.id,
+        parentId: w.issueA.id,
+      });
+      expect(res.status).toBe(201);
+      expect(res.body).toMatchObject({ projectId: w.projectA.id, goalId: w.goalA.id, parentId: w.issueA.id });
+    }
   });
 });
 
-describe("assertGoalsInCompany", () => {
-  it("rejects when any goal id is missing from the company", async () => {
-    const { db } = fakeDb(new Map([[goals, [{ id: "g1" }]]]));
-    await expect(assertGoalsInCompany(db, COMPANY, ["g1", "goal-foreign"])).rejects.toMatchObject({
-      status: 404,
-      message: "Goal not found",
+describe("project create/update rejects foreign goals", () => {
+  it("create with a foreign goal in goalIds -> 404 and no project", async () => {
+    const w = await seedWorld(db());
+    const before = await projectCount(w);
+    const res = await send(real.app, w.callers.member, "post", `/api/companies/${w.companyA.id}/projects`, {
+      name: "probe",
+      goalIds: [w.goalB.id],
     });
+    expect(res.status).toBe(404);
+    expect(await projectCount(w)).toBe(before);
   });
 
-  it("accepts when every goal belongs to the company", async () => {
-    const { db } = fakeDb(new Map([[goals, [{ id: "g1" }, { id: "g2" }]]]));
-    await expect(assertGoalsInCompany(db, COMPANY, ["g1", "g2", "g1"])).resolves.toBeUndefined();
+  it("create with a foreign legacy goalId and an empty goalIds list stores no foreign link", async () => {
+    const w = await seedWorld(db());
+    const before = await projectCount(w);
+    const res = await send(real.app, w.callers.member, "post", `/api/companies/${w.companyA.id}/projects`, {
+      name: "probe",
+      goalId: w.goalB.id,
+      goalIds: [],
+    });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(await projectCount(w)).toBe(before);
+    const leaked = await db().select({ id: projects.id }).from(projects).where(eq(projects.goalId, w.goalB.id));
+    expect(leaked).toHaveLength(0);
   });
 
-  it("does not query for an empty list", async () => {
-    const { db, select } = fakeDb(new Map());
-    await expect(assertGoalsInCompany(db, COMPANY, [])).resolves.toBeUndefined();
-    expect(select).not.toHaveBeenCalled();
+  it("create with a same-company goal stores it in both columns", async () => {
+    const w = await seedWorld(db());
+    const res = await send(real.app, w.callers.member, "post", `/api/companies/${w.companyA.id}/projects`, {
+      name: "ok",
+      goalIds: [w.goalA.id],
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.goalId).toBe(w.goalA.id);
+    expect(res.body.goalIds).toEqual([w.goalA.id]);
+  });
+
+  it("update with a foreign goal -> 404 and no link row", async () => {
+    const w = await seedWorld(db());
+    const res = await send(real.app, w.callers.member, "patch", `/api/projects/${w.projectA.id}`, {
+      goalIds: [w.goalB.id],
+    });
+    expect(res.status).toBe(404);
+    const links = await db().select().from(projectGoals).where(eq(projectGoals.projectId, w.projectA.id));
+    expect(links).toHaveLength(0);
   });
 });
 
-const readMocks = vi.hoisted(() => ({
-  issues: {
-    getById: vi.fn(),
-    getByIdentifier: vi.fn(async () => null),
-    getAncestors: vi.fn(async () => []),
-    findMentionedProjectIds: vi.fn(async () => []),
-  },
-  projects: { getById: vi.fn(), listByIds: vi.fn(async () => []) },
-  goals: { getById: vi.fn(), getDefaultCompanyGoal: vi.fn(async () => null) },
-}));
+describe("read paths never expand stored cross-company links", () => {
+  async function plantForeignWorkspace(w: World) {
+    return db()
+      .insert(projectWorkspaces)
+      .values({ companyId: w.companyB.id, projectId: w.projectB.id, name: `ws secret ${w.projectB.id}`, cwd: "/srv/foreign" })
+      .returning()
+      .then((r) => r[0]!);
+  }
 
-vi.mock("../services/index.js", () => ({
-  issueService: () => readMocks.issues,
-  accessService: () => ({}),
-  agentService: () => ({}),
-  goalService: () => readMocks.goals,
-  heartbeatService: () => ({}),
-  issueApprovalService: () => ({}),
-  projectService: () => readMocks.projects,
-  logActivity: vi.fn(async () => undefined),
-}));
+  it("GET /issues/:id: a same-company parent that links foreign project and goal discloses neither", async () => {
+    const w = await seedWorld(db());
+    const ws = await plantForeignWorkspace(w);
+    const parent = await db()
+      .insert(issues)
+      .values({ companyId: w.companyA.id, title: "parent", projectId: w.projectB.id, goalId: w.goalB.id })
+      .returning()
+      .then((r) => r[0]!);
+    const child = await db()
+      .insert(issues)
+      .values({ companyId: w.companyA.id, title: "child", parentId: parent.id, projectId: w.projectB.id, goalId: w.goalB.id })
+      .returning()
+      .then((r) => r[0]!);
 
-const { issueRoutes } = await import("../routes/issues.js");
-
-describe("GET /issues/:id hides foreign links", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    readMocks.issues.getById.mockResolvedValue({
-      id: "issue-1",
-      companyId: COMPANY,
-      projectId: "proj-foreign",
-      goalId: "goal-foreign",
-      title: "mine",
-    });
-    readMocks.projects.getById.mockResolvedValue({ id: "proj-foreign", companyId: OTHER_COMPANY, name: "secret project" });
-    readMocks.goals.getById.mockResolvedValue({ id: "goal-foreign", companyId: OTHER_COMPANY, title: "secret goal" });
-  });
-
-  it("returns null project and goal when they belong to another company", async () => {
-    const res = await request(appWithActor(ACTORS.member, issueRoutes({} as any, {} as any))).get("/api/issues/issue-1");
+    const res = await send(real.app, w.callers.member, "get", `/api/issues/${child.id}`);
     expect(res.status).toBe(200);
+    expect(res.body.ancestors.map((a: { id: string }) => a.id)).toEqual([parent.id]);
+    expect(res.body.ancestors[0].project).toBeNull();
+    expect(res.body.ancestors[0].goal).toBeNull();
     expect(res.body.project).toBeNull();
     expect(res.body.goal).toBeNull();
-    expect(JSON.stringify(res.body)).not.toContain("secret");
+    const text = JSON.stringify(res.body);
+    for (const secret of [w.projectB.name, "foreign description", w.goalB.title, ws.name, "/srv/foreign"]) {
+      expect(text).not.toContain(secret);
+    }
   });
 
-  it("returns same-company project and goal", async () => {
-    readMocks.projects.getById.mockResolvedValue({ id: "proj-foreign", companyId: COMPANY, name: "own project" });
-    readMocks.goals.getById.mockResolvedValue({ id: "goal-foreign", companyId: COMPANY, title: "own goal" });
-    const res = await request(appWithActor(ACTORS.member, issueRoutes({} as any, {} as any))).get("/api/issues/issue-1");
+  it("GET /issues/:id: the ancestor walk stops at a foreign parent", async () => {
+    const w = await seedWorld(db());
+    const child = await db()
+      .insert(issues)
+      .values({ companyId: w.companyA.id, title: "child", parentId: w.issueB.id })
+      .returning()
+      .then((r) => r[0]!);
+    const res = await send(real.app, w.callers.member, "get", `/api/issues/${child.id}`);
     expect(res.status).toBe(200);
-    expect(res.body.project.name).toBe("own project");
-    expect(res.body.goal.title).toBe("own goal");
+    expect(res.body.ancestors).toEqual([]);
+    expect(JSON.stringify(res.body)).not.toContain(w.issueB.title);
+  });
+
+  it("GET /projects/:id: foreign goal links and foreign workspace rows are not expanded", async () => {
+    const w = await seedWorld(db());
+    // Link rows that claim company A but point at company B's goal, and a
+    // link row stamped with company B: both inconsistent with the project.
+    await db().insert(projectGoals).values({ projectId: w.projectA.id, goalId: w.goalB.id, companyId: w.companyA.id });
+    await db().insert(projectGoals).values({ projectId: w.projectA.id, goalId: w.goalA.id, companyId: w.companyB.id });
+    await db()
+      .insert(projectWorkspaces)
+      .values({ companyId: w.companyB.id, projectId: w.projectA.id, name: "ws secret foreign", cwd: "/srv/foreign" });
+
+    const res = await send(real.app, w.callers.member, "get", `/api/projects/${w.projectA.id}`);
+    expect(res.status).toBe(200);
+    expect(res.body.goalIds).toEqual([]);
+    const text = JSON.stringify(res.body);
+    expect(text).not.toContain(w.goalB.title);
+    expect(text).not.toContain("ws secret foreign");
+  });
+
+  it("GET /companies/:companyId/costs/by-project never names a foreign project", async () => {
+    const w = await seedWorld(db());
+    const run = await db()
+      .insert(heartbeatRuns)
+      .values({ companyId: w.companyA.id, agentId: w.agentA.id, status: "succeeded", finishedAt: new Date(), usageJson: { costUsd: 1.5 } })
+      .returning()
+      .then((r) => r[0]!);
+    const linked = await db()
+      .insert(issues)
+      .values({ companyId: w.companyA.id, title: "costed", projectId: w.projectB.id })
+      .returning()
+      .then((r) => r[0]!);
+    await db().insert(activityLog).values({
+      companyId: w.companyA.id,
+      actorType: "agent",
+      actorId: w.agentA.id,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: linked.id,
+      runId: run.id,
+    });
+    const res = await send(real.app, w.callers.member, "get", `/api/companies/${w.companyA.id}/costs/by-project`);
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(w.projectB.name);
+  });
+});
+
+describe("approval agent targets stay inside the approval company (SEC-056)", () => {
+  const agentState = (id: string) =>
+    db().select({ status: agents.status }).from(agents).where(eq(agents.id, id)).then((r) => r[0]!.status);
+  const liveKeys = (agentId: string) =>
+    db()
+      .select({ id: agentApiKeys.id, revokedAt: agentApiKeys.revokedAt })
+      .from(agentApiKeys)
+      .where(eq(agentApiKeys.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.revokedAt === null).length);
+  const approvalCount = (w: World) =>
+    db().select({ id: approvals.id }).from(approvals).where(eq(approvals.companyId, w.companyA.id)).then((r) => r.length);
+
+  it("create with a foreign payload.agentId or requestedByAgentId -> 404 and nothing stored", async () => {
+    const w = await seedWorld(db());
+    const before = await approvalCount(w);
+    const foreignTarget = await send(real.app, w.callers.member, "post", `/api/companies/${w.companyA.id}/approvals`, {
+      type: "hire_agent",
+      payload: { agentId: w.agentB.id, name: "x" },
+    });
+    const foreignRequester = await send(real.app, w.callers.member, "post", `/api/companies/${w.companyA.id}/approvals`, {
+      type: "approve_ceo_strategy",
+      requestedByAgentId: w.agentB.id,
+      payload: {},
+    });
+    expect(foreignTarget.status).toBe(404);
+    expect(foreignRequester.status).toBe(404);
+    expect(await approvalCount(w)).toBe(before);
+  });
+
+  it("rejecting a stored approval that targets a foreign agent leaves that agent and its keys alone", async () => {
+    const w = await seedWorld(db());
+    const planted = await db()
+      .insert(approvals)
+      .values({ companyId: w.companyA.id, type: "hire_agent", status: "pending", payload: { agentId: w.agentB.id } })
+      .returning()
+      .then((r) => r[0]!);
+    const res = await send(real.app, w.callers.member, "post", `/api/approvals/${planted.id}/reject`, {});
+    expect(res.status).toBe(404);
+    expect(await agentState(w.agentB.id)).toBe("idle");
+    expect(await liveKeys(w.agentB.id)).toBe(1);
+    const row = await db().select().from(approvals).where(eq(approvals.id, planted.id)).then((r) => r[0]!);
+    expect(row.status).toBe("pending");
+  });
+
+  it("approving a stored approval with a foreign requester does not resolve or wake it", async () => {
+    const w = await seedWorld(db());
+    const planted = await db()
+      .insert(approvals)
+      .values({ companyId: w.companyA.id, type: "approve_ceo_strategy", status: "pending", payload: {}, requestedByAgentId: w.agentB.id })
+      .returning()
+      .then((r) => r[0]!);
+    const res = await send(real.app, w.callers.member, "post", `/api/approvals/${planted.id}/approve`, {});
+    expect(res.status).toBe(404);
+    const row = await db().select().from(approvals).where(eq(approvals.id, planted.id)).then((r) => r[0]!);
+    expect(row.status).toBe("pending");
+  });
+
+  it("resubmitting with a foreign payload.agentId -> 404 and the payload is unchanged", async () => {
+    const w = await seedWorld(db());
+    const planted = await db()
+      .insert(approvals)
+      .values({ companyId: w.companyA.id, type: "hire_agent", status: "revision_requested", payload: { name: "x" } })
+      .returning()
+      .then((r) => r[0]!);
+    const res = await send(real.app, w.callers.member, "post", `/api/approvals/${planted.id}/resubmit`, {
+      payload: { agentId: w.agentB.id },
+    });
+    expect(res.status).toBe(404);
+    const row = await db().select().from(approvals).where(eq(approvals.id, planted.id)).then((r) => r[0]!);
+    expect(row).toMatchObject({ status: "revision_requested", payload: { name: "x" } });
+  });
+
+  it("rejecting a same-company hire terminates that agent and revokes its keys", async () => {
+    const w = await seedWorld(db());
+    await db().update(agents).set({ status: "pending_approval" }).where(eq(agents.id, w.peerA.id));
+    const approval = await db()
+      .insert(approvals)
+      .values({ companyId: w.companyA.id, type: "hire_agent", status: "pending", payload: { agentId: w.peerA.id } })
+      .returning()
+      .then((r) => r[0]!);
+    const res = await send(real.app, w.callers.member, "post", `/api/approvals/${approval.id}/reject`, {});
+    expect(res.status).toBe(200);
+    expect(await agentState(w.peerA.id)).toBe("terminated");
+    expect(await liveKeys(w.peerA.id)).toBe(0);
+    // The foreign agent is untouched.
+    expect(await liveKeys(w.agentB.id)).toBe(1);
+    const otherKeys = await db()
+      .select()
+      .from(agentApiKeys)
+      .where(and(eq(agentApiKeys.agentId, w.agentA.id)));
+    expect(otherKeys.every((k) => k.revokedAt === null)).toBe(true);
   });
 });
