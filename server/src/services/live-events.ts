@@ -74,11 +74,49 @@ export function registerLiveEventsConnection(
   };
 }
 
+// Upgrades in flight (SEC-060). Authorization reads the database before the
+// socket is registered, so a revocation landing in that gap would find no
+// connection to close. Every revocation is therefore also logged for a short
+// window; an upgrade takes a mark before authorizing and is refused at
+// registration if a matching revocation happened after its mark.
+export const LIVE_EVENTS_UPGRADE_WINDOW_MS = 60_000;
+let revocationSeq = 0;
+const recentRevocations: Array<{ seq: number; at: number; filter: LiveEventsConnectionFilter }> = [];
+
+export interface LiveEventsUpgradeMark {
+  seq: number;
+  at: number;
+}
+
+export function beginLiveEventsUpgrade(): LiveEventsUpgradeMark {
+  return { seq: revocationSeq, at: Date.now() };
+}
+
+function matches(filter: LiveEventsConnectionFilter, context: LiveEventsConnectionContext) {
+  const keys = (Object.keys(filter) as Array<keyof LiveEventsConnectionFilter>).filter(
+    (key) => filter[key] !== undefined,
+  );
+  return keys.length > 0 && keys.every((key) => context[key] === filter[key]);
+}
+
+export function revokedDuringUpgrade(mark: LiveEventsUpgradeMark, context: LiveEventsConnectionContext) {
+  // ponytail: an upgrade older than the log window cannot be proven clean;
+  // refuse it and let the client reconnect.
+  if (Date.now() - mark.at > LIVE_EVENTS_UPGRADE_WINDOW_MS) return true;
+  return recentRevocations.some((entry) => entry.seq > mark.seq && matches(entry.filter, context));
+}
+
 export function closeLiveEventsConnections(filter: LiveEventsConnectionFilter, reason: string) {
   const keys = (Object.keys(filter) as Array<keyof LiveEventsConnectionFilter>).filter(
     (key) => filter[key] !== undefined,
   );
   if (keys.length === 0) return 0;
+
+  const now = Date.now();
+  recentRevocations.push({ seq: ++revocationSeq, at: now, filter: { ...filter } });
+  while (recentRevocations.length > 0 && now - recentRevocations[0]!.at > LIVE_EVENTS_UPGRADE_WINDOW_MS) {
+    recentRevocations.shift();
+  }
 
   let closed = 0;
   for (const entry of Array.from(connections)) {

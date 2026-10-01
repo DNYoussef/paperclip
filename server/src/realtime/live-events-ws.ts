@@ -9,9 +9,12 @@ import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import {
+  beginLiveEventsUpgrade,
   registerLiveEventsConnection,
+  revokedDuringUpgrade,
   subscribeCompanyLiveEvents,
   type LiveEventsConnectionContext,
+  type LiveEventsUpgradeMark,
 } from "../services/live-events.js";
 
 // SEC-060: a socket is re-authorized only at upgrade time, so its lifetime is
@@ -52,6 +55,7 @@ type UpgradeContext = LiveEventsConnectionContext;
 
 interface IncomingMessageWithContext extends IncomingMessage {
   paperclipUpgradeContext?: UpgradeContext;
+  paperclipUpgradeMark?: LiveEventsUpgradeMark;
 }
 
 function hashToken(token: string) {
@@ -238,11 +242,10 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
-    const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
-      if (socket.readyState !== WebSocket.OPEN) return;
-      socket.send(JSON.stringify(event));
-    });
-
+    // Register before subscribing, then re-check revocations that landed
+    // while the upgrade was being authorized; both happen in this tick, so no
+    // revocation can fall between them.
+    let unsubscribe = () => {};
     const cleanup = () => {
       unsubscribe();
       unregister();
@@ -253,6 +256,16 @@ export function setupLiveEventsWebSocketServer(
     const unregister = registerLiveEventsConnection(context, (code, reason) => {
       cleanup();
       socket.close(code, reason);
+    });
+    const mark = (req as IncomingMessageWithContext).paperclipUpgradeMark;
+    if (!mark || revokedDuringUpgrade(mark, context)) {
+      cleanup();
+      socket.close(1008, "revoked during upgrade; reconnect");
+      return;
+    }
+    unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify(event));
     });
 
     cleanupByClient.set(socket, cleanup);
@@ -287,6 +300,7 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
+    const mark = beginLiveEventsUpgrade();
     void authorizeUpgrade(db, req, companyId, url, {
       deploymentMode: opts.deploymentMode,
       resolveSessionFromHeaders: opts.resolveSessionFromHeaders,
@@ -299,6 +313,7 @@ export function setupLiveEventsWebSocketServer(
 
         const reqWithContext = req as IncomingMessageWithContext;
         reqWithContext.paperclipUpgradeContext = context;
+        reqWithContext.paperclipUpgradeMark = mark;
 
         wss.handleUpgrade(req, socket, head, (ws: WsSocket) => {
           wss.emit("connection", ws, reqWithContext);

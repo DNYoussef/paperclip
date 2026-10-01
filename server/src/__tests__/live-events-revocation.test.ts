@@ -168,6 +168,113 @@ describe("agent revocation closes live sockets", () => {
   });
 });
 
+describe("revocation during an in-flight upgrade (SEC-060)", () => {
+  // A second live-events server whose database handle and session resolver
+  // run a hook at a precise point inside upgrade authorization: after the
+  // credential checks, before the socket is registered. The hook performs a
+  // real revocation through the app.
+  let raceServer: Server;
+  let raceWss: { close: () => void };
+  let raceBase: string;
+  const gap: { agent: null | (() => Promise<void>); session: null | (() => Promise<void>) } = { agent: null, session: null };
+
+  beforeAll(async () => {
+    const proxiedDb = new Proxy(real.db as any, {
+      get(target, prop) {
+        // authorizeUpgrade's last await on the agent path is the lastUsedAt
+        // update, after the key and agent checks.
+        if (prop === "update" && gap.agent) {
+          return (table: unknown) => ({
+            set: (values: unknown) => ({
+              where: async (condition: unknown) => {
+                const hook = gap.agent;
+                gap.agent = null;
+                if (hook) await hook();
+                return target.update(table).set(values).where(condition);
+              },
+            }),
+          });
+        }
+        const value = target[prop];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    raceServer = createServer(real.app);
+    raceWss = setupLiveEventsWebSocketServer(raceServer, proxiedDb, {
+      deploymentMode: "authenticated",
+      resolveSessionFromHeaders: async (headers: Headers) => {
+        const userId = headers.get("x-test-user");
+        if (!userId) return null;
+        const session = { session: { id: headers.get("x-test-session") ?? `session-${userId}`, userId }, user: { id: userId, email: null, name: null } };
+        // The session was valid when resolved; logout lands right after.
+        const hook = gap.session;
+        gap.session = null;
+        if (hook) await hook();
+        return session as any;
+      },
+    });
+    await new Promise<void>((resolve) => raceServer.listen(0, "127.0.0.1", resolve));
+    raceBase = `ws://127.0.0.1:${(raceServer.address() as AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    for (const client of (raceWss as any)?.clients ?? []) client.terminate();
+    raceWss?.close();
+    raceServer?.closeAllConnections();
+    await new Promise<void>((resolve) => raceServer?.close(() => resolve()));
+  });
+
+  function openRace(companyId: string, headers: Record<string, string>): Promise<Client> {
+    const ws = new WebSocket(`${raceBase}/api/companies/${companyId}/events/ws`, { headers });
+    const events: unknown[] = [];
+    ws.on("message", (data: Buffer) => events.push(JSON.parse(data.toString())));
+    const closed = new Promise<{ code: number }>((resolve) => ws.on("close", (code: number) => resolve({ code })));
+    return new Promise((resolve, reject) => {
+      ws.once("open", () => {
+        const client = { ws, events, closed } as Client;
+        (client as any).companyId = companyId;
+        resolve(client);
+      });
+      ws.once("unexpected-response", (_req: unknown, res: { statusCode: number }) => reject(new Error(`upgrade ${res.statusCode}`)));
+      ws.once("error", reject);
+    });
+  }
+
+  it("a key revoked after the key check but before registration never streams", async () => {
+    const w = await seedWorld(real.db);
+    gap.agent = async () => {
+      const res = await send(real.app, w.callers.member, "delete", `/api/agents/${w.agentA.id}/keys/${w.keyA.id}`);
+      expect(res.status).toBe(200);
+    };
+    const client = await openRace(w.companyA.id, { authorization: `Bearer ${w.keyA.token}` });
+    expect(gap.agent).toBeNull();
+    await expectClosed(client);
+  });
+
+  it("a session logged out after resolution but before registration never streams", async () => {
+    const w = await seedWorld(real.db);
+    gap.session = async () => {
+      const res = await send(real.app, { kind: "board", userId: w.users.member, sessionId: "race-s1" }, "post", "/api/auth/sign-out", {});
+      expect(res.status).toBe(200);
+    };
+    const client = await openRace(w.companyA.id, { "x-test-user": w.users.member, "x-test-session": "race-s1" });
+    expect(gap.session).toBeNull();
+    await expectClosed(client);
+  });
+
+  it("control: an unrelated revocation in the gap does not close the new stream", async () => {
+    const w = await seedWorld(real.db);
+    gap.agent = async () => {
+      const res = await send(real.app, w.callers.member, "delete", `/api/agents/${w.peerA.id}/keys/${w.keyPeerA.id}`);
+      expect(res.status).toBe(200);
+    };
+    const client = await openRace(w.companyA.id, { authorization: `Bearer ${w.keyA.token}` });
+    expect(gap.agent).toBeNull();
+    await expectOpen(client, w.companyA.id);
+    client.ws.close();
+  });
+});
+
 describe("termination is atomic and retryable (SEC-060)", () => {
   // Fault injection in the real database: while a row named key_revoke
   // exists, revoking an agent key raises inside the same transaction.
@@ -313,6 +420,8 @@ describe("live events bounded connection lifetime", () => {
     };
     localWss.emit("connection", socket, {
       paperclipUpgradeContext: { companyId: "c1", actorType: "board", actorId: "u1", userId: "u1", sessionId: "s1" },
+      // An upgrade mark later than any revocation: authorized and clean.
+      paperclipUpgradeMark: { seq: Number.MAX_SAFE_INTEGER, at: Date.now() },
     });
     localWss.clients.add(socket);
 
