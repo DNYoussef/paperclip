@@ -72,6 +72,10 @@ beforeEach(() => {
 const db = () => real.db;
 const statusOf = (agentId: string) =>
   db().select({ status: agents.status }).from(agents).where(eq(agents.id, agentId)).then((r) => r[0]!.status);
+// The run row is finalized before the agent row, so a live agent's final
+// status is awaited rather than read once.
+const settlesTo = (agentId: string, status: string) =>
+  vi.waitFor(async () => expect(await statusOf(agentId)).toBe(status), { timeout: 5_000, interval: 50 });
 
 async function freshWorker(w: World, extra: Partial<typeof agents.$inferInsert> = {}) {
   return db()
@@ -102,7 +106,7 @@ describe("run startup is abandoned when the agent or run stops being runnable (S
     const run = await wakeAndSettle(worker.id);
     expect(run?.status).toBe("succeeded");
     expect(probe.launches).toEqual([run!.id]);
-    expect(await statusOf(worker.id)).toBe("idle");
+    await settlesTo(worker.id, "idle");
   });
 
   it("termination during setup: no adapter launch, status stays terminated", async () => {
@@ -148,7 +152,7 @@ describe("run startup is abandoned when the agent or run stops being runnable (S
     const run = await wakeAndSettle(worker.id);
     expect(probe.launches).toEqual([]);
     expect(run?.status).toBe("cancelled");
-    expect(await statusOf(worker.id)).toBe("idle");
+    await settlesTo(worker.id, "idle");
   });
 });
 
