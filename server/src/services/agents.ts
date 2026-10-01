@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, inArray, ne } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -15,6 +15,7 @@ import { isUuidLike, normalizeAgentUrlKey } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
+import { closeLiveEventsConnections } from "./live-events.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -196,6 +197,17 @@ export function agentService(db: Db) {
     });
   }
 
+  // SEC-060: the single place a terminated agent loses its credentials. Every
+  // path that commits status "terminated" (terminate, PATCH, approval
+  // rejection) runs this after the status write.
+  async function invalidateAgentCredentials(id: string, reason: string) {
+    await db
+      .update(agentApiKeys)
+      .set({ revokedAt: new Date() })
+      .where(and(eq(agentApiKeys.agentId, id), isNull(agentApiKeys.revokedAt)));
+    closeLiveEventsConnections({ agentId: id }, reason);
+  }
+
   async function getById(id: string) {
     const row = await db
       .select()
@@ -302,6 +314,9 @@ export function agentService(db: Db) {
       .returning()
       .then((rows) => rows[0] ?? null);
     const normalizedUpdated = updated ? normalizeAgentRow(updated) : null;
+    if (normalizedUpdated?.status === "terminated" && existing.status !== "terminated") {
+      await invalidateAgentCredentials(id, "agent terminated");
+    }
 
     if (normalizedUpdated && shouldRecordRevision && beforeConfig) {
       const afterConfig = buildConfigSnapshot(normalizedUpdated);
@@ -399,11 +414,7 @@ export function agentService(db: Db) {
         .update(agents)
         .set({ status: "terminated", updatedAt: new Date() })
         .where(eq(agents.id, id));
-
-      await db
-        .update(agentApiKeys)
-        .set({ revokedAt: new Date() })
-        .where(eq(agentApiKeys.agentId, id));
+      await invalidateAgentCredentials(id, "agent terminated");
 
       return getById(id);
     },
@@ -426,6 +437,9 @@ export function agentService(db: Db) {
           .returning()
           .then((rows) => rows[0] ?? null);
         return deleted ? normalizeAgentRow(deleted) : null;
+      }).then((deleted) => {
+        if (deleted) closeLiveEventsConnections({ agentId: id }, "agent deleted");
+        return deleted;
       });
     },
 
@@ -549,6 +563,7 @@ export function agentService(db: Db) {
         .set({ revokedAt: new Date() })
         .where(and(eq(agentApiKeys.id, keyId), eq(agentApiKeys.agentId, agentId)))
         .returning();
+      if (rows[0]) closeLiveEventsConnections({ keyId }, "key revoked");
       return rows[0] ?? null;
     },
 

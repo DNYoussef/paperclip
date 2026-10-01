@@ -34,7 +34,6 @@ import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { findServerAdapter, listAdapterModels } from "../adapters/index.js";
 import { redactEventPayload } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
-import { closeLiveEventsConnections } from "../services/live-events.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import {
   DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX,
@@ -1132,6 +1131,9 @@ export function agentRoutes(db: Db) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
+    if (agent.status === "terminated" && existing.status !== "terminated") {
+      await heartbeat.cancelActiveForAgent(id);
+    }
 
     await logActivity(db, {
       companyId: agent.companyId,
@@ -1213,7 +1215,6 @@ export function agentRoutes(db: Db) {
     }
 
     await heartbeat.cancelActiveForAgent(id);
-    closeLiveEventsConnections({ agentId: id }, "agent terminated");
 
     await logActivity(db, {
       companyId: agent.companyId,
@@ -1235,7 +1236,6 @@ export function agentRoutes(db: Db) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    closeLiveEventsConnections({ agentId: id }, "agent deleted");
 
     await logActivity(db, {
       companyId: agent.companyId,
@@ -1283,7 +1283,6 @@ export function agentRoutes(db: Db) {
       res.status(404).json({ error: "Key not found" });
       return;
     }
-    closeLiveEventsConnections({ keyId }, "key revoked");
     res.json({ ok: true });
   });
 

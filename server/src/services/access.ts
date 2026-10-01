@@ -144,11 +144,14 @@ export function accessService(db: Db) {
   }
 
   async function demoteInstanceAdmin(userId: string) {
-    return db
+    const removed = await db
       .delete(instanceUserRoles)
       .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
       .returning()
       .then((rows) => rows[0] ?? null);
+    // SEC-060: admin-only streams reconnect and are re-authorized as a member.
+    if (removed) closeLiveEventsConnections({ userId }, "instance admin removed");
+    return removed;
   }
 
   async function listUserCompanyAccess(userId: string) {
@@ -207,6 +210,13 @@ export function accessService(db: Db) {
           .where(eq(companyMemberships.id, existing.id))
           .returning()
           .then((rows) => rows[0] ?? null);
+        // SEC-060: leaving "active" (suspended, pending) ends live streams.
+        if (existing.status === "active" && status !== "active") {
+          closeLiveEventsConnections(
+            principalType === "agent" ? { agentId: principalId, companyId } : { userId: principalId, companyId },
+            "membership no longer active",
+          );
+        }
         return updated ?? existing;
       }
       return existing;

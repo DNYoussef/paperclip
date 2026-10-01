@@ -94,7 +94,7 @@ export async function createApp(
         : null;
       if (sessionId) {
         res.on("finish", () => {
-          closeLiveEventsConnections({ sessionId }, "logout");
+          if (res.statusCode < 400) closeLiveEventsConnections({ sessionId }, "logout");
         });
       }
       next();

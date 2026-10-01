@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { agentApiKeys, agents, companyMemberships, instanceUserRoles } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
@@ -167,6 +167,22 @@ async function authorizeUpgrade(
     .then((rows) => rows[0] ?? null);
 
   if (!key || key.companyId !== companyId) {
+    return null;
+  }
+
+  // SEC-060: same rule as the HTTP actor middleware; a terminated or
+  // unapproved agent cannot open a stream even with an unrevoked key.
+  const agentRow = await db
+    .select({ companyId: agents.companyId, status: agents.status })
+    .from(agents)
+    .where(eq(agents.id, key.agentId))
+    .then((rows) => rows[0] ?? null);
+  if (
+    !agentRow ||
+    agentRow.companyId !== companyId ||
+    agentRow.status === "terminated" ||
+    agentRow.status === "pending_approval"
+  ) {
     return null;
   }
 
