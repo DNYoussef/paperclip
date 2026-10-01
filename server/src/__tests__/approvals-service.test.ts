@@ -96,7 +96,10 @@ describe("approvalService resolution idempotency", () => {
 
     expect(result.applied).toBe(false);
     expect(result.approval.status).toBe("rejected");
-    expect(mockAgentService.terminate).not.toHaveBeenCalled();
+    // SEC-060: the retry is still a no-op for the approval row, but it
+    // re-asserts the (idempotent) termination so an interrupted first attempt
+    // cannot leave the hired agent's credentials live.
+    expect(mockAgentService.terminate).toHaveBeenCalledWith("agent-1");
   });
 
   it("still performs side effects when the resolution update is newly applied", async () => {

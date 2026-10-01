@@ -199,13 +199,30 @@ export function agentService(db: Db) {
 
   // SEC-060: the single place a terminated agent loses its credentials. Every
   // path that commits status "terminated" (terminate, PATCH, approval
-  // rejection) runs this after the status write.
-  async function invalidateAgentCredentials(id: string, reason: string) {
-    await db
-      .update(agentApiKeys)
-      .set({ revokedAt: new Date() })
-      .where(and(eq(agentApiKeys.agentId, id), isNull(agentApiKeys.revokedAt)));
-    closeLiveEventsConnections({ agentId: id }, reason);
+  // rejection) writes the status and revokes every key in ONE transaction,
+  // and closes sockets only after that commit. It also runs when the agent is
+  // already terminated, so a retry repairs an earlier interrupted attempt.
+  async function writeAgentAndInvalidateIfTerminated(
+    id: string,
+    patch: Partial<typeof agents.$inferInsert>,
+  ) {
+    const row = await db.transaction(async (tx) => {
+      const updated = await tx
+        .update(agents)
+        .set({ ...patch, updatedAt: new Date() })
+        .where(eq(agents.id, id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (updated?.status === "terminated") {
+        await tx
+          .update(agentApiKeys)
+          .set({ revokedAt: new Date() })
+          .where(and(eq(agentApiKeys.agentId, id), isNull(agentApiKeys.revokedAt)));
+      }
+      return updated;
+    });
+    if (row?.status === "terminated") closeLiveEventsConnections({ agentId: id }, "agent terminated");
+    return row;
   }
 
   async function getById(id: string) {
@@ -307,16 +324,8 @@ export function agentService(db: Db) {
     const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
     const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
 
-    const updated = await db
-      .update(agents)
-      .set({ ...normalizedPatch, updatedAt: new Date() })
-      .where(eq(agents.id, id))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const updated = await writeAgentAndInvalidateIfTerminated(id, normalizedPatch);
     const normalizedUpdated = updated ? normalizeAgentRow(updated) : null;
-    if (normalizedUpdated?.status === "terminated" && existing.status !== "terminated") {
-      await invalidateAgentCredentials(id, "agent terminated");
-    }
 
     if (normalizedUpdated && shouldRecordRevision && beforeConfig) {
       const afterConfig = buildConfigSnapshot(normalizedUpdated);
@@ -410,11 +419,7 @@ export function agentService(db: Db) {
       const existing = await getById(id);
       if (!existing) return null;
 
-      await db
-        .update(agents)
-        .set({ status: "terminated", updatedAt: new Date() })
-        .where(eq(agents.id, id));
-      await invalidateAgentCredentials(id, "agent terminated");
+      await writeAgentAndInvalidateIfTerminated(id, { status: "terminated" });
 
       return getById(id);
     },

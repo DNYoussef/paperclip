@@ -2,9 +2,9 @@ import { EventEmitter } from "node:events";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createRequire } from "node:module";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, approvals } from "@paperclipai/db";
+import { agentApiKeys, agents, approvals } from "@paperclipai/db";
 import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
 import { accessService } from "../services/index.js";
 import { publishLiveEvent } from "../services/live-events.js";
@@ -165,6 +165,96 @@ describe("agent revocation closes live sockets", () => {
   it("a foreign agent key cannot open company A's stream", async () => {
     const w = await seedWorld(real.db);
     await expect(open(w.companyA.id, { token: w.keyB.token })).rejects.toThrow(/upgrade 403/);
+  });
+});
+
+describe("termination is atomic and retryable (SEC-060)", () => {
+  // Fault injection in the real database: while a row named key_revoke
+  // exists, revoking an agent key raises inside the same transaction.
+  beforeAll(async () => {
+    await real.db.execute(sql`create table if not exists test_faults (name text primary key)`);
+    await real.db.execute(sql`
+      create or replace function test_fail_key_revoke() returns trigger as $$
+      begin
+        if exists (select 1 from test_faults where name = 'key_revoke') then
+          raise exception 'injected key revocation failure';
+        end if;
+        return new;
+      end $$ language plpgsql`);
+    await real.db.execute(sql`
+      create trigger test_fail_key_revoke before update on agent_api_keys for each row
+      when (new.revoked_at is not null and old.revoked_at is null)
+      execute function test_fail_key_revoke()`);
+  });
+  const fault = (on: boolean) =>
+    on
+      ? real.db.execute(sql`insert into test_faults (name) values ('key_revoke') on conflict do nothing`)
+      : real.db.execute(sql`delete from test_faults where name = 'key_revoke'`);
+  const agentStatus = (id: string) =>
+    real.db.select({ status: agents.status }).from(agents).where(eq(agents.id, id)).then((r) => r[0]!.status);
+  const liveKeys = (agentId: string) =>
+    real.db
+      .select({ revokedAt: agentApiKeys.revokedAt })
+      .from(agentApiKeys)
+      .where(eq(agentApiKeys.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.revokedAt === null).length);
+
+  it("a failed key revocation rolls the termination back; the retry completes it and closes the socket", async () => {
+    const w = await seedWorld(real.db);
+    const target = await openTagged(w.companyA.id, tokenOf(w).target);
+    await fault(true);
+    try {
+      const failed = await send(real.app, w.callers.member, "patch", `/api/agents/${w.agentA.id}`, { status: "terminated" });
+      expect(failed.status).toBe(500);
+    } finally {
+      await fault(false);
+    }
+    // Nothing half-committed: the agent is not terminated and keeps its key,
+    // so its open socket is consistent with the stored state.
+    expect(await agentStatus(w.agentA.id)).toBe("idle");
+    expect(await liveKeys(w.agentA.id)).toBe(1);
+    await expectOpen(target, w.companyA.id);
+
+    const retried = await send(real.app, w.callers.member, "patch", `/api/agents/${w.agentA.id}`, { status: "terminated" });
+    expect(retried.status).toBe(200);
+    expect(await agentStatus(w.agentA.id)).toBe("terminated");
+    expect(await liveKeys(w.agentA.id)).toBe(0);
+    await expectClosed(target);
+  });
+
+  it("re-terminating an already terminated agent repairs live keys and sockets left by an older failure", async () => {
+    const w = await seedWorld(real.db);
+    const target = await openTagged(w.companyA.id, tokenOf(w).target);
+    // Partial state as left by pre-fix code: status committed, key live.
+    await real.db.update(agents).set({ status: "terminated" }).where(eq(agents.id, w.agentA.id));
+    const res = await send(real.app, w.callers.member, "patch", `/api/agents/${w.agentA.id}`, { status: "terminated" });
+    expect(res.status).toBe(200);
+    expect(await liveKeys(w.agentA.id)).toBe(0);
+    await expectClosed(target);
+  });
+
+  it("a hire rejection interrupted by a revocation failure is finished by retrying the rejection", async () => {
+    const w = await seedWorld(real.db);
+    await real.db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, w.agentA.id));
+    const approval = await real.db
+      .insert(approvals)
+      .values({ companyId: w.companyA.id, type: "hire_agent", status: "pending", payload: { agentId: w.agentA.id } })
+      .returning()
+      .then((r) => r[0]!);
+    await fault(true);
+    try {
+      const failed = await send(real.app, w.callers.member, "post", `/api/approvals/${approval.id}/reject`, {});
+      expect(failed.status).toBe(500);
+    } finally {
+      await fault(false);
+    }
+    expect(await liveKeys(w.agentA.id)).toBe(1);
+    expect(await agentStatus(w.agentA.id)).toBe("pending_approval");
+
+    const retried = await send(real.app, w.callers.member, "post", `/api/approvals/${approval.id}/reject`, {});
+    expect(retried.status).toBe(200);
+    expect(await agentStatus(w.agentA.id)).toBe("terminated");
+    expect(await liveKeys(w.agentA.id)).toBe(0);
   });
 });
 

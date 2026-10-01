@@ -46,6 +46,13 @@ export function approvalService(db: Db) {
     decisionNote: string | null | undefined,
   ): Promise<ResolutionResult> {
     const existing = await getExistingApproval(id);
+    // Checked before the idempotent early return too: a retry may still run
+    // side effects (finishing an interrupted hire rejection).
+    await assertAgentsInCompany(
+      db,
+      existing.companyId,
+      approvalAgentRefs(existing.type, existing.payload, existing.requestedByAgentId),
+    );
     if (!canResolveStatuses.has(existing.status)) {
       if (existing.status === targetStatus) {
         return { approval: existing, applied: false };
@@ -54,11 +61,6 @@ export function approvalService(db: Db) {
         `Only pending or revision requested approvals can be ${targetStatus === "approved" ? "approved" : "rejected"}`,
       );
     }
-    await assertAgentsInCompany(
-      db,
-      existing.companyId,
-      approvalAgentRefs(existing.type, existing.payload, existing.requestedByAgentId),
-    );
 
     const now = new Date();
     const updated = await db
@@ -174,7 +176,10 @@ export function approvalService(db: Db) {
         decisionNote,
       );
 
-      if (applied && updated.type === "hire_agent") {
+      // SEC-060: terminate on every rejected outcome, not only the first
+      // apply, so a retry finishes a termination that failed after the
+      // approval row was committed. terminate() is idempotent.
+      if (updated.status === "rejected" && updated.type === "hire_agent") {
         const payload = updated.payload as Record<string, unknown>;
         const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
         if (payloadAgentId) {
