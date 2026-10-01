@@ -13,6 +13,7 @@ import {
 } from "@paperclipai/shared";
 import { listWorkspaceRuntimeServicesForProjectWorkspaces } from "./workspace-runtime.js";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
+import { assertGoalsInCompany } from "./company-scoped-refs.js";
 
 type ProjectRow = typeof projects.$inferSelect;
 type ProjectWorkspaceRow = typeof projectWorkspaces.$inferSelect;
@@ -60,7 +61,8 @@ async function attachGoals(db: Db, rows: ProjectRow[]): Promise<ProjectWithGoals
       goalTitle: goals.title,
     })
     .from(projectGoals)
-    .innerJoin(goals, eq(projectGoals.goalId, goals.id))
+    // SEC-062: a linked goal is only expanded when it belongs to the same company.
+    .innerJoin(goals, and(eq(projectGoals.goalId, goals.id), eq(goals.companyId, projectGoals.companyId)))
     .where(inArray(projectGoals.projectId, projectIds));
 
   const map = new Map<string, ProjectGoalRef[]>();
@@ -361,6 +363,7 @@ export function projectService(db: Db) {
     ): Promise<ProjectWithGoals> => {
       const { goalIds: inputGoalIds, ...projectData } = data;
       const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
+      if (ids) await assertGoalsInCompany(db, companyId, ids);
 
       // Auto-assign a color from the palette if none provided
       if (!projectData.color) {
@@ -406,6 +409,7 @@ export function projectService(db: Db) {
         .where(eq(projects.id, id))
         .then((rows) => rows[0] ?? null);
       if (!existingProject) return null;
+      if (ids) await assertGoalsInCompany(db, existingProject.companyId, ids);
 
       if (projectData.name !== undefined) {
         const existingShortname = normalizeProjectUrlKey(existingProject.name);

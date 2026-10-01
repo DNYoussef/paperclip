@@ -291,7 +291,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const [ancestors, project, goal, mentionedProjectIds] = await Promise.all([
+    const [ancestors, linkedProject, linkedGoal, mentionedProjectIds] = await Promise.all([
       svc.getAncestors(issue.id),
       issue.projectId ? projectsSvc.getById(issue.projectId) : null,
       issue.goalId
@@ -301,6 +301,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
           : null,
       svc.findMentionedProjectIds(issue.id),
     ]);
+    // SEC-062: a pre-existing cross-company link is never expanded.
+    const project = linkedProject && linkedProject.companyId === issue.companyId ? linkedProject : null;
+    const goal = linkedGoal && linkedGoal.companyId === issue.companyId ? linkedGoal : null;
     const mentionedProjects = mentionedProjectIds.length > 0
       ? await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
       : [];
