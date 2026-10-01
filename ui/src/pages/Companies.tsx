@@ -4,6 +4,7 @@ import { useCompany } from "../context/CompanyContext";
 import { useDialog } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { companiesApi } from "../api/companies";
+import { healthApi } from "../api/health";
 import { queryKeys } from "../lib/queryKeys";
 import { formatCents, relativeTime } from "../lib/utils";
 import { Input } from "@/components/ui/input";
@@ -44,6 +45,13 @@ export function Companies() {
     queryKey: queryKeys.companies.stats,
     queryFn: () => companiesApi.stats(),
   });
+  // SEC-066: the server refuses deletion unless the instance enabled it.
+  const { data: health } = useQuery({
+    queryKey: queryKeys.health,
+    queryFn: () => healthApi.get(),
+    retry: false,
+  });
+  const companyDeletionEnabled = health?.features?.companyDeletionEnabled === true;
 
   // Inline edit state
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -217,14 +225,18 @@ export function Companies() {
                         <Pencil className="h-3.5 w-3.5" />
                         Rename
                       </DropdownMenuItem>
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        variant="destructive"
-                        onClick={() => setConfirmDeleteId(company.id)}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                        Delete Company
-                      </DropdownMenuItem>
+                      {companyDeletionEnabled && (
+                        <>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            variant="destructive"
+                            onClick={() => setConfirmDeleteId(company.id)}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            Delete Company
+                          </DropdownMenuItem>
+                        </>
+                      )}
                     </DropdownMenuContent>
                   </DropdownMenu>
                 </div>

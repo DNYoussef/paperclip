@@ -11,8 +11,9 @@ import { forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { accessService, companyPortabilityService, companyService, logActivity } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import { closeLiveEventsConnections } from "../services/live-events.js";
 
-export function companyRoutes(db: Db) {
+export function companyRoutes(db: Db, opts: { companyDeletionEnabled: boolean } = { companyDeletionEnabled: false }) {
   const router = Router();
   const svc = companyService(db);
   const portability = companyPortabilityService(db);
@@ -167,14 +168,23 @@ export function companyRoutes(db: Db) {
   });
 
   router.delete("/:companyId", async (req, res) => {
+    // SEC-066: hard deletion is off unless the operator enabled it, and even
+    // then only an instance admin may destroy a company and its history.
+    if (!opts.companyDeletionEnabled) {
+      throw forbidden("Company deletion is disabled on this instance");
+    }
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    if (!(req.actor.source === "local_implicit" || req.actor.isInstanceAdmin)) {
+      throw forbidden("Instance admin required");
+    }
     const company = await svc.remove(companyId);
     if (!company) {
       res.status(404).json({ error: "Company not found" });
       return;
     }
+    closeLiveEventsConnections({ companyId }, "company deleted");
     res.json({ ok: true });
   });
 
