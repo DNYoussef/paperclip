@@ -57,6 +57,16 @@ export function approvalRoutes(db: Db) {
   router.post("/companies/:companyId/approvals", validate(createApprovalSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    // SEC-056: an agent may only name itself as requester; board callers may
+    // name any agent of this company (checked in the service).
+    if (
+      req.actor.type === "agent" &&
+      req.body.requestedByAgentId != null &&
+      req.body.requestedByAgentId !== req.actor.agentId
+    ) {
+      res.status(403).json({ error: "Agents can only request approvals as themselves" });
+      return;
+    }
     const rawIssueIds = req.body.issueIds;
     const issueIds = Array.isArray(rawIssueIds)
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")

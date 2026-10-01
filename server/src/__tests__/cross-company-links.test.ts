@@ -244,6 +244,38 @@ describe("approval agent targets stay inside the approval company (SEC-056)", ()
     expect(await approvalCount(w)).toBe(before);
   });
 
+  it("an agent may only name itself as requester", async () => {
+    const w = await seedWorld(db());
+    const before = await approvalCount(w);
+    const other = await send(real.app, w.callers.peerAgent, "post", `/api/companies/${w.companyA.id}/approvals`, {
+      type: "approve_ceo_strategy",
+      requestedByAgentId: w.agentA.id,
+      payload: {},
+    });
+    expect(other.status).toBe(403);
+    expect(await approvalCount(w)).toBe(before);
+
+    for (const body of [
+      { type: "approve_ceo_strategy", requestedByAgentId: w.peerA.id, payload: {} },
+      { type: "approve_ceo_strategy", payload: {} },
+    ]) {
+      const res = await send(real.app, w.callers.peerAgent, "post", `/api/companies/${w.companyA.id}/approvals`, body);
+      expect(res.status).toBe(201);
+      expect(res.body.requestedByAgentId).toBe(w.peerA.id);
+    }
+  });
+
+  it("a board member may name any agent of the same company as requester", async () => {
+    const w = await seedWorld(db());
+    const res = await send(real.app, w.callers.member, "post", `/api/companies/${w.companyA.id}/approvals`, {
+      type: "approve_ceo_strategy",
+      requestedByAgentId: w.agentA.id,
+      payload: {},
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.requestedByAgentId).toBe(w.agentA.id);
+  });
+
   it("rejecting a stored approval that targets a foreign agent leaves that agent and its keys alone", async () => {
     const w = await seedWorld(db());
     const planted = await db()
