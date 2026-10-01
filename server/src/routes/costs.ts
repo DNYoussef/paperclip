@@ -71,8 +71,9 @@ export function costRoutes(db: Db) {
   });
 
   router.patch("/companies/:companyId/budgets", validate(updateBudgetSchema), async (req, res) => {
-    assertBoard(req);
     const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
     const company = await companies.update(companyId, { budgetMonthlyCents: req.body.budgetMonthlyCents });
     if (!company) {
       res.status(404).json({ error: "Company not found" });
@@ -93,18 +94,24 @@ export function costRoutes(db: Db) {
   });
 
   router.patch("/agents/:agentId/budgets", validate(updateBudgetSchema), async (req, res) => {
+    // SEC-055: authenticate (401) before touching the agent, then authorize
+    // against the agent's company before any write.
+    const actor = getActorInfo(req);
     const agentId = req.params.agentId as string;
     const agent = await agents.getById(agentId);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
+    assertCompanyAccess(req, agent.companyId);
 
     if (req.actor.type === "agent") {
       if (req.actor.agentId !== agentId) {
         res.status(403).json({ error: "Agent can only change its own budget" });
         return;
       }
+    } else {
+      assertBoard(req);
     }
 
     const updated = await agents.update(agentId, { budgetMonthlyCents: req.body.budgetMonthlyCents });
@@ -113,7 +120,6 @@ export function costRoutes(db: Db) {
       return;
     }
 
-    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: updated.companyId,
       actorType: actor.actorType,
