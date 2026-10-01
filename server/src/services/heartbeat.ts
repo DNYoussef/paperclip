@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -927,7 +927,8 @@ export function heartbeatService(db: Db) {
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(agents.id, agentId))
+      // SEC-060: never move a paused or terminated agent (read above) back.
+      .where(and(eq(agents.id, agentId), notInArray(agents.status, ["paused", "terminated"])))
       .returning()
       .then((rows) => rows[0] ?? null);
 
@@ -1305,7 +1306,8 @@ export function heartbeatService(db: Db) {
       const runningAgent = await db
         .update(agents)
         .set({ status: "running", updatedAt: new Date() })
-        .where(eq(agents.id, agent.id))
+        // SEC-060: terminated is terminal, even for a run that was already starting.
+        .where(and(eq(agents.id, agent.id), ne(agents.status, "terminated")))
         .returning()
         .then((rows) => rows[0] ?? null);
 

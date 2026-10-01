@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, inArray, isNull, ne } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -207,6 +207,16 @@ export function agentService(db: Db) {
     patch: Partial<typeof agents.$inferInsert>,
   ) {
     const row = await db.transaction(async (tx) => {
+      // SEC-060: lifecycle rules are checked against the locked current row,
+      // not an earlier snapshot, so a concurrent termination always wins.
+      const current = await tx
+        .select({ status: agents.status })
+        .from(agents)
+        .where(eq(agents.id, id))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!current) return null;
+      if (patch.status !== undefined) assertLifecycleTransition(current.status, patch.status);
       const updated = await tx
         .update(agents)
         .set({ ...patch, updatedAt: new Date() })
@@ -223,6 +233,26 @@ export function agentService(db: Db) {
     });
     if (row?.status === "terminated") closeLiveEventsConnections({ agentId: id }, "agent terminated");
     return row;
+  }
+
+  function assertLifecycleTransition(from: string, to: string) {
+    if (from === "terminated" && to !== "terminated") {
+      throw conflict("Terminated agents cannot be resumed");
+    }
+    if (from === "pending_approval" && to !== "pending_approval" && to !== "terminated") {
+      throw conflict("Pending approval agents cannot be activated directly");
+    }
+  }
+
+  // Status writes outside updateAgent use a conditional update so the stored
+  // status, not an earlier read, decides; terminated is terminal.
+  async function setStatusUnless(id: string, status: string, blocked: string[]) {
+    return db
+      .update(agents)
+      .set({ status, updatedAt: new Date() })
+      .where(and(eq(agents.id, id), notInArray(agents.status, blocked)))
+      .returning()
+      .then((rows) => rows[0] ?? null);
   }
 
   async function getById(id: string) {
@@ -389,13 +419,9 @@ export function agentService(db: Db) {
       if (!existing) return null;
       if (existing.status === "terminated") throw conflict("Cannot pause terminated agent");
 
-      const updated = await db
-        .update(agents)
-        .set({ status: "paused", updatedAt: new Date() })
-        .where(eq(agents.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      return updated ? normalizeAgentRow(updated) : null;
+      const updated = await setStatusUnless(id, "paused", ["terminated"]);
+      if (!updated) throw conflict("Cannot pause terminated agent");
+      return normalizeAgentRow(updated);
     },
 
     resume: async (id: string) => {
@@ -406,13 +432,9 @@ export function agentService(db: Db) {
         throw conflict("Pending approval agents cannot be resumed");
       }
 
-      const updated = await db
-        .update(agents)
-        .set({ status: "idle", updatedAt: new Date() })
-        .where(eq(agents.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      return updated ? normalizeAgentRow(updated) : null;
+      const updated = await setStatusUnless(id, "idle", ["terminated", "pending_approval"]);
+      if (!updated) throw conflict("Cannot resume terminated agent");
+      return normalizeAgentRow(updated);
     },
 
     terminate: async (id: string) => {
@@ -456,11 +478,11 @@ export function agentService(db: Db) {
       const updated = await db
         .update(agents)
         .set({ status: "idle", updatedAt: new Date() })
-        .where(eq(agents.id, id))
+        .where(and(eq(agents.id, id), eq(agents.status, "pending_approval")))
         .returning()
         .then((rows) => rows[0] ?? null);
 
-      return updated ? normalizeAgentRow(updated) : null;
+      return updated ? normalizeAgentRow(updated) : getById(id);
     },
 
     updatePermissions: async (id: string, permissions: { canCreateAgents: boolean }) => {

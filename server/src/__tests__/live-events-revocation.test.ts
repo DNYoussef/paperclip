@@ -8,7 +8,8 @@ import { agentApiKeys, agents, approvals } from "@paperclipai/db";
 import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
 import { accessService } from "../services/index.js";
 import { publishLiveEvent } from "../services/live-events.js";
-import { send, seedWorld, startRealApp, type RealApp, type World } from "./helpers/real-app.js";
+import { buildApp, send, seedWorld, startRealApp, type RealApp, type World } from "./helpers/real-app.js";
+import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 
 // SEC-060 end to end: real WebSocket clients against the real upgrade
 // handler, the real app and PostgreSQL. Each revocation is performed by the
@@ -362,6 +363,71 @@ describe("termination is atomic and retryable (SEC-060)", () => {
     expect(retried.status).toBe(200);
     expect(await agentStatus(w.agentA.id)).toBe("terminated");
     expect(await liveKeys(w.agentA.id)).toBe(0);
+  });
+});
+
+describe("terminated is terminal under concurrency (SEC-060)", () => {
+  // A second app whose database handle runs a hook when the next write
+  // transaction starts: after the PATCH route authorized the agent and its
+  // service read the old status, before the write. The hook terminates the
+  // agent through the real app.
+  const gapHook: { fn: null | (() => Promise<void>) } = { fn: null };
+  let racingApp: Awaited<ReturnType<typeof buildApp>>;
+
+  beforeAll(async () => {
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = process.env.PAPERCLIP_AGENT_JWT_SECRET ?? "test-only-jwt-secret";
+    const proxiedDb = new Proxy(real.db as any, {
+      get(target, prop) {
+        if (prop === "transaction" && gapHook.fn) {
+          return async (...args: unknown[]) => {
+            const hook = gapHook.fn;
+            gapHook.fn = null;
+            if (hook) await hook();
+            return target.transaction(...args);
+          };
+        }
+        const value = target[prop];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    racingApp = await buildApp(proxiedDb);
+  });
+
+  it("a self-PATCH overlapping termination cannot resurrect the agent or its JWT", async () => {
+    const w = await seedWorld(real.db);
+    const jwt = createLocalAgentJwt(w.agentA.id, w.companyA.id, "process", w.runA.id);
+    expect(jwt).toBeTruthy();
+    // Control: the JWT authenticates while the agent is alive.
+    expect((await send(real.app, { kind: "agent", token: jwt! }, "get", "/api/agents/me")).status).toBe(200);
+
+    gapHook.fn = async () => {
+      const res = await send(real.app, w.callers.member, "post", `/api/agents/${w.agentA.id}/terminate`);
+      expect(res.status).toBe(200);
+    };
+    const patch = await send(racingApp, w.callers.targetAgent, "patch", `/api/agents/${w.agentA.id}`, {
+      status: "idle",
+      title: "still here",
+    });
+    expect(gapHook.fn).toBeNull();
+    expect(patch.status).toBe(409);
+    expect(await real.db.select({ status: agents.status }).from(agents).where(eq(agents.id, w.agentA.id)).then((r) => r[0]!.status)).toBe("terminated");
+    expect((await send(real.app, { kind: "agent", token: jwt! }, "get", "/api/agents/me")).status).toBe(401);
+  });
+
+  it("pause and resume cannot move a terminated agent", async () => {
+    const w = await seedWorld(real.db);
+    await real.db.update(agents).set({ status: "terminated" }).where(eq(agents.id, w.agentA.id));
+    for (const action of ["pause", "resume"]) {
+      const res = await send(real.app, w.callers.member, "post", `/api/agents/${w.agentA.id}/${action}`);
+      expect(res.status).toBe(409);
+    }
+    expect(await real.db.select({ status: agents.status }).from(agents).where(eq(agents.id, w.agentA.id)).then((r) => r[0]!.status)).toBe("terminated");
+  });
+
+  it("control: a non-overlapping self-PATCH of a live agent still succeeds", async () => {
+    const w = await seedWorld(real.db);
+    const res = await send(racingApp, w.callers.targetAgent, "patch", `/api/agents/${w.agentA.id}`, { title: "fine" });
+    expect(res.status).toBe(200);
   });
 });
 
