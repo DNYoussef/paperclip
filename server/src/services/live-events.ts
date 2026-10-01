@@ -50,6 +50,8 @@ export interface LiveEventsConnectionContext {
   sessionId?: string;
   agentId?: string;
   keyId?: string;
+  // Epoch ms when the authenticating session expires (board sessions).
+  sessionExpiresAt?: number;
 }
 
 export type LiveEventsConnectionFilter = Partial<

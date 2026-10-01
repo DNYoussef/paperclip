@@ -22,7 +22,7 @@ export type BetterAuthSessionUser = {
 };
 
 export type BetterAuthSessionResult = {
-  session: { id: string; userId: string } | null;
+  session: { id: string; userId: string; expiresAt?: Date | null } | null;
   user: BetterAuthSessionUser | null;
 };
 
@@ -176,11 +176,16 @@ export async function resolveBetterAuthSessionFromHeaders(
   if (!sessionValue || typeof sessionValue !== "object") return null;
 
   const value = sessionValue as {
-    session?: { id?: string; userId?: string } | null;
+    session?: { id?: string; userId?: string; expiresAt?: Date | string | null } | null;
     user?: { id?: string; email?: string | null; name?: string | null } | null;
   };
   const session = value.session?.id && value.session.userId
-    ? { id: value.session.id, userId: value.session.userId }
+    ? {
+        id: value.session.id,
+        userId: value.session.userId,
+        // SEC-060: kept so a live-events stream ends when its session does.
+        expiresAt: value.session.expiresAt ? new Date(value.session.expiresAt) : null,
+      }
     : null;
   const user = value.user?.id
     ? {

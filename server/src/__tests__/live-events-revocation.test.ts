@@ -70,7 +70,11 @@ beforeAll(async () => {
       const userId = headers.get("x-test-user");
       if (!userId) return null;
       const sessionId = headers.get("x-test-session") ?? `session-${userId}`;
-      return { session: { id: sessionId, userId }, user: { id: userId, email: null, name: null } } as any;
+      const expires = headers.get("x-test-expires-at");
+      return {
+        session: { id: sessionId, userId, expiresAt: expires ? new Date(Number(expires)) : null },
+        user: { id: userId, email: null, name: null },
+      } as any;
     },
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -92,7 +96,10 @@ interface Client {
   closed: Promise<{ code: number }>;
 }
 
-type Who = { token: string } | { userId: string; sessionId?: string } | { cookie: string };
+type Who =
+  | { token: string }
+  | { userId: string; sessionId?: string; expiresAt?: number }
+  | { cookie: string };
 
 function open(companyId: string, who: Who): Promise<Client> {
   const headers: Record<string, string> =
@@ -100,7 +107,11 @@ function open(companyId: string, who: Who): Promise<Client> {
       ? { authorization: `Bearer ${who.token}` }
       : "cookie" in who
         ? { cookie: who.cookie }
-        : { "x-test-user": who.userId, ...(who.sessionId ? { "x-test-session": who.sessionId } : {}) };
+        : {
+            "x-test-user": who.userId,
+            ...(who.sessionId ? { "x-test-session": who.sessionId } : {}),
+            ...(who.expiresAt ? { "x-test-expires-at": String(who.expiresAt) } : {}),
+          };
   const ws = new WebSocket(`${base}/api/companies/${companyId}/events/ws`, { headers });
   const events: unknown[] = [];
   ws.on("message", (data: Buffer) => events.push(JSON.parse(data.toString())));
@@ -660,6 +671,38 @@ describe("board revocation closes live sockets", () => {
   it("an outsider cannot open company A's stream", async () => {
     const w = await seedWorld(real.db);
     await expect(open(w.companyA.id, { userId: w.users.outsider })).rejects.toThrow(/upgrade 403/);
+  });
+});
+
+describe("live events end when the session expires (SEC-060)", () => {
+  it("a stream closes at its session's expiry without any further request; a valid session stays open", async () => {
+    const w = await seedWorld(real.db);
+    const expiring = await openTagged(w.companyA.id, {
+      userId: w.users.member,
+      sessionId: "expiring",
+      expiresAt: Date.now() + 1200,
+    });
+    const valid = await openTagged(w.companyA.id, { userId: w.users.member, sessionId: "valid" });
+    await expectOpen(expiring, w.companyA.id);
+    await expectClosed(expiring);
+    await expectOpen(valid, w.companyA.id);
+    valid.ws.close();
+  });
+
+  it("an already expired session cannot open a stream", async () => {
+    const w = await seedWorld(real.db);
+    await expect(
+      open(w.companyA.id, { userId: w.users.member, sessionId: "stale", expiresAt: Date.now() - 1000 }),
+    ).rejects.toThrow(/upgrade 403/);
+  });
+
+  it("the real Better Auth resolver reports the session expiry", async () => {
+    const w = await seedWorld(real.db);
+    const user = await signUp(w);
+    const headers = new Headers({ cookie: user.cookie });
+    const resolved = await resolveBetterAuthSessionFromHeaders(auth, headers);
+    expect(resolved?.session?.expiresAt).toBeInstanceOf(Date);
+    expect(resolved!.session!.expiresAt!.getTime()).toBeGreaterThan(Date.now());
   });
 });
 

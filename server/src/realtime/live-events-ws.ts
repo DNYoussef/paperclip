@@ -132,6 +132,8 @@ async function authorizeUpgrade(
     const userId = session?.user?.id;
     if (!userId) return null;
     const sessionId = session?.session?.id;
+    const expiresAtMs = session?.session?.expiresAt ? new Date(session.session.expiresAt).getTime() : NaN;
+    if (Number.isFinite(expiresAtMs) && expiresAtMs <= Date.now()) return null;
 
     const [roleRow, memberships] = await Promise.all([
       db
@@ -160,6 +162,7 @@ async function authorizeUpgrade(
       actorId: userId,
       userId,
       sessionId,
+      ...(Number.isFinite(expiresAtMs) ? { sessionExpiresAt: expiresAtMs } : {}),
     };
   }
 
@@ -215,17 +218,9 @@ export function setupLiveEventsWebSocketServer(
   const wss = new WebSocketServer({ noServer: true });
   const cleanupByClient = new Map<WsSocket, () => void>();
   const aliveByClient = new Map<WsSocket, boolean>();
-  const connectedAtByClient = new Map<WsSocket, number>();
 
   const pingInterval = setInterval(() => {
-    const now = Date.now();
     for (const socket of wss.clients) {
-      const connectedAt = connectedAtByClient.get(socket);
-      if (connectedAt !== undefined && now - connectedAt > LIVE_EVENTS_MAX_CONNECTION_MS) {
-        cleanupByClient.get(socket)?.();
-        socket.close(1008, "connection lifetime exceeded; reconnect");
-        continue;
-      }
       if (!aliveByClient.get(socket)) {
         socket.terminate();
         continue;
@@ -246,12 +241,13 @@ export function setupLiveEventsWebSocketServer(
     // while the upgrade was being authorized; both happen in this tick, so no
     // revocation can fall between them.
     let unsubscribe = () => {};
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
     const cleanup = () => {
       unsubscribe();
       unregister();
+      if (deadlineTimer) clearTimeout(deadlineTimer);
       cleanupByClient.delete(socket);
       aliveByClient.delete(socket);
-      connectedAtByClient.delete(socket);
     };
     const unregister = registerLiveEventsConnection(context, (code, reason) => {
       cleanup();
@@ -263,14 +259,25 @@ export function setupLiveEventsWebSocketServer(
       socket.close(1008, "revoked during upgrade; reconnect");
       return;
     }
+    // SEC-060: the stream ends at the earlier of the session's expiry and
+    // the maximum connection age; the client reconnects and re-authorizes.
+    const deadline = Math.min(context.sessionExpiresAt ?? Infinity, Date.now() + LIVE_EVENTS_MAX_CONNECTION_MS);
+    const expire = () => {
+      cleanup();
+      socket.close(1008, "session or connection lifetime ended; reconnect");
+    };
+    deadlineTimer = setTimeout(expire, Math.max(0, deadline - Date.now()));
     unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
       if (socket.readyState !== WebSocket.OPEN) return;
+      if (Date.now() >= deadline) {
+        expire();
+        return;
+      }
       socket.send(JSON.stringify(event));
     });
 
     cleanupByClient.set(socket, cleanup);
     aliveByClient.set(socket, true);
-    connectedAtByClient.set(socket, Date.now());
 
     socket.on("pong", () => {
       aliveByClient.set(socket, true);
