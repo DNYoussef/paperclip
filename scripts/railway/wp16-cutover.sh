@@ -85,6 +85,19 @@ const run = async (s) => {
     console.log(`WP16_DBNOW ${r.now}`);
     return r.live === 0 && (!arg || r.since === 0);
   }
+  if (mode === "writes") {
+    // Secrets and uploads land on the container disk (key file, data/storage),
+    // and nothing can block the API during cutover. Any created after the
+    // snapshot may have been written to a disk that was then replaced.
+    if (!ISO_TS.test(arg || "")) throw new Error("since-ts is not an ISO UTC timestamp");
+    const [r] = await s`select
+      (select count(*)::int from company_secret_versions where created_at > ${arg}::timestamptz) as secrets,
+      (select count(*)::int from assets where created_at > ${arg}::timestamptz) as assets,
+      (select count(*)::int from issue_attachments where created_at > ${arg}::timestamptz) as attachments`;
+    console.log(`WP16_INFO created_since_snapshot secrets=${r.secrets} assets=${r.assets} attachments=${r.attachments}`);
+    if (r.secrets + r.assets + r.attachments > 0) console.log("WP16_ERR secrets or uploads created during cutover may be lost; check them before resume");
+    return r.secrets + r.assets + r.attachments === 0;
+  }
   if (mode === "runlogs") {
     const rows = await s`select log_ref from heartbeat_runs where log_store = 'local_file' and log_ref is not null`;
     const missing = rows.filter((r) => !fs.existsSync(path.resolve(arg, r.log_ref)));
@@ -222,6 +235,11 @@ step_record() { # rollback facts; variable NAMES only (values pass through cut, 
 }
 
 ISO_TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$'
+snap_ts() { # the snapshot's DB time; the regex admits no quote or space
+  local t; t="$(cat "$OUT/snapshot-db-time.txt")" || die "no snapshot time"
+  [[ "$t" =~ $ISO_TS_RE ]] || die "snapshot time is not an ISO UTC timestamp"
+  printf '%s' "$t"
+}
 quiesce_once() { # quiesce_once <outfile> [since-ts]; since-ts travels as ONE quoted argument
   local since=""
   if [ -n "${2:-}" ]; then
@@ -369,6 +387,7 @@ echo "WP16_INV_BEGIN"; sed 's#paperclip/instances/default/logs/pre-wp16/#papercl
 rm -rf /tmp/wp16-x /tmp/wp16.tgz /tmp/wp16-up.b64
 EOF
     db_sh; printf 'node /tmp/wp16-db.cjs runlogs %s/data/run-logs || die "runlog reconciliation failed"\n' "$I"
+    printf "node /tmp/wp16-db.cjs writes '%s' || die \"writes since snapshot\"\n" "$(snap_ts)"
   } | remote restore "$OUT/restore.txt"
   block INV "$OUT/restore.txt" > "$OUT/inventory-restored.txt"
   grep '^WP16_WSDIRS' "$OUT/restore.txt" | diff "$OUT/wsdirs-before.txt" - > /dev/null || die "workspace dirs differ after restore"
@@ -402,6 +421,7 @@ find paperclip/instances/default/data/run-logs paperclip/instances/default/logs/
 while IFS= read -r f; do sha256sum "$f" >> /tmp/wp16-inv || die "hash failed"; done < /tmp/wp16-files
 echo "WP16_INV_BEGIN"; sed 's#paperclip/instances/default/logs/pre-wp16/#paperclip/instances/default/logs/#' /tmp/wp16-inv | LC_ALL=C sort -k2; echo "WP16_INV_END"
 EOF
+    db_sh; printf "node /tmp/wp16-db.cjs writes '%s' || die \"writes since snapshot\"\n" "$(snap_ts)"
   } | remote probe-check "$OUT/probe-check.txt"
   grep -qx "WP16_PROBE $nonce" "$OUT/probe-check.txt" || die "probe content lost across redeploy"
   block INV "$OUT/probe-check.txt" > "$OUT/inventory-after.txt"
@@ -412,9 +432,28 @@ EOF
 }
 
 step_resume() { # after PAPERCLIP_STATE_PERSISTS; HEARTBEAT_SCHEDULER_ENABLED was unset before attach
-  railway variable delete -s "$SVC" HEARTBEAT_SCHEDULER_ENABLED > /dev/null
-  confirm "Wait until the redeploy triggered by the variable delete is Active."
+  # Re-runnable: if an earlier attempt deleted the variable but its deploy
+  # failed, redeploy instead. Names only pass through cut.
+  if railway variable list -s "$SVC" --kv | cut -d= -f1 | grep -qx HEARTBEAT_SCHEDULER_ENABLED; then
+    railway variable delete -s "$SVC" HEARTBEAT_SCHEDULER_ENABLED > /dev/null
+    confirm "Wait until the redeploy triggered by the variable delete is Active."
+  else
+    confirm "Variable already gone. Redeploy $SVC (railway redeploy -s $SVC -y) and wait for Active."
+  fi
   step_verify_runtime
+  # The running server's own environment must not carry the off switch.
+  cat <<'EOF' | remote resume-check "$OUT/resume-check.txt"
+n=0
+for d in /proc/[0-9]*; do
+  c="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" || continue
+  case "$c" in "node --import ./server/node_modules/tsx/dist/loader.mjs server/src/index.ts"*)
+    n=$((n + 1))
+    if tr '\0' '\n' < "$d/environ" | grep -q '^HEARTBEAT_SCHEDULER_ENABLED='; then die "server still has HEARTBEAT_SCHEDULER_ENABLED set"; fi ;;
+  esac
+done
+[ "$n" -gt 0 ] || die "server process not found"
+echo "WP16_INFO scheduler variable absent in $n server process(es)"
+EOF
   say "Heartbeat scheduler re-enabled (overdue agents run at boot)."
 }
 
