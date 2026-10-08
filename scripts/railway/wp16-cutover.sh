@@ -51,7 +51,7 @@ remote() {
       || die "upload failed in step $step (stderr in $out.err)"
     i=$((i + 6000))
   done
-  if ! railway ssh -s "$SVC" -- "echo '$h  $d/s.b64' | sha256sum -c --status || { echo 'WP16_ERR uploaded step script hash mismatch'; exit 1; }; base64 -d $d/s.b64 > $d/s.sh && sh $d/s.sh; r=\$?; rm -rf $d; exit \$r" > "$out.raw" 2> "$out.err"; then
+  if ! railway ssh -s "$SVC" -- "echo '$h  $d/s.b64' | sha256sum -c --status || { echo 'WP16_ERR uploaded step script hash mismatch'; exit 1; }; base64 -d $d/s.b64 > $d/s.sh && sh $d/s.sh > $d/o 2>&1; r=\$?; cat $d/o; rm -rf $d; exit \$r" > "$out.raw" 2> "$out.err"; then
     tr -d '\r' < "$out.raw" | grep -E '^WP16_(ERR|WARN)' >&2 || true
     die "railway ssh failed in step $step (stderr in $out.err)"
   fi
