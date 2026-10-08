@@ -34,7 +34,7 @@ Run it from Git Bash, one step at a time, with
 | `quiesce` | original | Owner deactivates the n8n workflows that call Paperclip. The step then polls until there are zero queued or running heartbeat runs. |
 | `snapshot` | original, still running | Takes the hash inventory and the DB run-log baseline (rows, present, missing). Builds `tar \| base64` and compares the sha256 computed on each end. Checks that every inventoried file is in the archive. |
 | `recheck` | original | Right before attach: no runs created since the snapshot, run logs byte-identical, same set of server log files. |
-| `attach` | new container | Sets `PAPERCLIP_DB_BACKUP_ENABLED=false` and adds the volume. The owner deploys the WP-16 image, then `verify-runtime` runs. |
+| `attach` | new container | Sets `PAPERCLIP_DB_BACKUP_ENABLED=false`. The owner deploys the WP-16 image FIRST, with no volume, and only then does the step attach the volume, so the old `USER node` image never boots on a root-owned mount. `verify-runtime` runs after that. |
 | `restore` | new | Refuses unless the volume holds nothing outside `logs/`. Uploads the archive as base64 in chunks and checks its sha256. Run logs go in place; the old server logs go to `logs/pre-wp16/`, never over the live log. Runs `chown -R -h`, checks that every hash matches, and checks the DB reconciliation: no newly missing run logs compared with the baseline. |
 | `probe-plant`, redeploy, `probe-check` | new | The random nonce's content survives a redeploy, every hash still matches, `verify-runtime` passes again, and the step prints `PAPERCLIP_STATE_PERSISTS`. The owner then re-activates the same n8n workflows. |
 

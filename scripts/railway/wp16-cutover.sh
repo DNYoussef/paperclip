@@ -63,12 +63,14 @@ if (!process.env.DATABASE_URL) { console.log("WP16_ERR DATABASE_URL not set; sha
 const sql = postgres(process.env.DATABASE_URL, { max: 1, onnotice: () => {} });
 const [mode, arg] = process.argv.slice(2);
 const inside = (p) => p === "/paperclip" || p.startsWith("/paperclip/");
+const ISO_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
 const run = async (s) => {
   if (mode === "quiesce") {
+    if (arg !== undefined && !ISO_TS.test(arg)) throw new Error("since-ts is not an ISO UTC timestamp");
     const [r] = await s`select
       (select count(*)::int from heartbeat_runs where status in ('queued','running')) as live,
       (select count(*)::int from heartbeat_runs where ${arg || null}::timestamptz is not null and created_at > ${arg || null}::timestamptz) as since,
-      now()::text as now`;
+      to_char(now() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as now`;
     console.log(`WP16_INFO live_runs=${r.live} runs_created_since=${arg ? r.since : "n/a"}`);
     console.log(`WP16_DBNOW ${r.now}`);
     return r.live === 0 && (!arg || r.since === 0);
@@ -201,8 +203,14 @@ step_record() { # rollback facts; variable NAMES only (values pass through cut, 
   sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' "$OUT/deployments-before.json" | head -n 1
 }
 
-quiesce_once() { # quiesce_once <outfile> [since-ts]
-  { db_sh; printf 'node /tmp/wp16-db.cjs quiesce %s || die "not quiesced"\n' "${2:-}"; } | remote quiesce "$1"
+ISO_TS_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$'
+quiesce_once() { # quiesce_once <outfile> [since-ts]; since-ts travels as ONE quoted argument
+  local since=""
+  if [ -n "${2:-}" ]; then
+    [[ "$2" =~ $ISO_TS_RE ]] || die "since-ts is not an ISO UTC timestamp"
+    since=" '$2'"   # safe to single-quote: the regex admits no quote or space
+  fi
+  { db_sh; printf 'node /tmp/wp16-db.cjs quiesce%s || die "not quiesced"\n' "$since"; } | remote quiesce "$1"
 }
 
 step_quiesce() {
@@ -218,7 +226,7 @@ step_quiesce() {
 step_snapshot() { # from the STILL-RUNNING original container; nothing is redeployed before this
   quiesce_once "$OUT/quiesce.txt"
   sed -n 's/^WP16_DBNOW //p' "$OUT/quiesce.txt" > "$OUT/snapshot-db-time.txt"
-  [ -s "$OUT/snapshot-db-time.txt" ] || die "no DB timestamp"
+  [[ "$(cat "$OUT/snapshot-db-time.txt")" =~ $ISO_TS_RE ]] || die "DB timestamp missing or not ISO UTC"
   { shape_sh; db_sh; printf 'node /tmp/wp16-db.cjs runlogs %s/data/run-logs || die "runlog reconciliation failed"\n' "$I"
     inventory_sh; cat <<'EOF'
 tar -C / -czf /tmp/wp16.tgz paperclip/instances/default/data/run-logs paperclip/instances/default/logs || die "tar failed"
@@ -260,8 +268,10 @@ step_recheck() { # right before attach: nothing new in the original since the sn
 step_attach() { # new image + volume + backups off, heartbeats still paused (= restore-only mode)
   [ -s "$OUT/paperclip-runlogs.tgz.sha256" ] || die "no verified snapshot"
   railway variable set -s "$SVC" --skip-deploys PAPERCLIP_DB_BACKUP_ENABLED=false > /dev/null
+  # New image FIRST: the old USER node image must never boot on a root-owned mount.
+  confirm "Deploy the WP-16 image commit to $SVC (merge to its deploy branch), with NO volume yet. n8n heartbeats stay paused. Wait until the deployment is Active."
   railway volume -s "$SVC" add -m /paperclip --json > "$OUT/volume-add.json"
-  confirm "Deploy the WP-16 image commit to $SVC (merge to its deploy branch). n8n heartbeats stay paused. Wait until the deployment is Active."
+  confirm "Wait until the redeploy triggered by attaching the volume is Active (still the WP-16 image)."
   step_verify_runtime
 }
 
