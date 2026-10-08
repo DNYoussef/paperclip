@@ -3,10 +3,10 @@
 #
 # Written for the shape measured on 2026-10-07 and nothing else. Preflight
 # asserts that shape and aborts with "shape changed, re-plan" if it differs.
-#   /paperclip/instances/default/{data/{backups,run-logs},logs,workspaces(empty)}
-#   no config.json, .env, secrets/ or data/storage; Postgres external; master
-#   key from its pinned variable.
-# Migrated set: data/run-logs and logs. data/backups is NOT migrated (see
+#   /paperclip/instances/default/{data/{backups,run-logs},logs,workspaces(dirs only)}
+#   no config.json, .env, secrets/ or data/storage; Postgres external; no
+#   master key variable or file and no stored secrets (measured 2026-10-08).
+# Migrated set: data/run-logs, logs and the empty workspaces dirs. data/backups is NOT migrated (see
 # README). Run from Git Bash, one step at a time, in the order of `help`.
 #
 # Never prints environment values: remote steps print verdicts, counts,
@@ -107,6 +107,11 @@ const run = async (s) => {
       if (!ok) { bad++; console.log(`WP16_ERR ${k} points outside /paperclip; shape changed, re-plan`); }
     }
     console.log(`WP16_INFO path_overrides=${rows.length} outside=${bad}`);
+    // No master key variable and no key file (measured 2026-10-08): stored
+    // secrets would have no key to decrypt with, so there must be none.
+    const [sv] = await s`select count(*)::int as n from company_secret_versions`;
+    console.log(`WP16_INFO secret_versions=${sv.n} master_key_variable=${Boolean(process.env.PAPERCLIP_SECRETS_MASTER_KEY)}`);
+    if (sv.n > 0 && !process.env.PAPERCLIP_SECRETS_MASTER_KEY) { bad++; console.log("WP16_ERR secrets stored without a master key variable; shape changed, re-plan"); }
     return bad === 0;
   }
   throw new Error("unknown mode");
@@ -132,7 +137,10 @@ want_ls /paperclip instances
 want_ls /paperclip/instances default
 want_ls "$I" "data logs workspaces"
 want_ls "$I/data" "backups run-logs"
-want_ls "$I/workspaces" ""
+# Agent workspace dirs (one per agent id, created by the server) may exist but
+# must hold no files: only directories are carried across.
+find "$I/workspaces" -mindepth 1 ! -type d > /tmp/wp16-ws || die "find failed"
+[ ! -s /tmp/wp16-ws ] || die "shape changed, re-plan: workspaces holds files"
 find /paperclip -name '.*' ! -path "$I/data/backups/*" > /tmp/wp16-hidden || die "find failed"
 [ ! -s /tmp/wp16-hidden ] || die "shape changed, re-plan: hidden files present"
 find "$I/data/run-logs" "$I/logs" ! -type f ! -type d > /tmp/wp16-odd || die "find failed"
@@ -161,7 +169,6 @@ const checks = [
   ["storage provider is local_disk", c.storageProvider === "local_disk"],
   ["storage dir is " + root + "/data/storage", c.storageLocalDiskBaseDir === root + "/data/storage"],
   ["run-log base is " + root + "/data/run-logs", runLogBase === root + "/data/run-logs"],
-  ["master key comes from its variable", Boolean(process.env.PAPERCLIP_SECRETS_MASTER_KEY)],
   ["no master key file", !fs.existsSync(c.secretsMasterKeyFilePath)],
   ["external database", Boolean(process.env.DATABASE_URL)],
   ["CODEX_HOME unset or under /paperclip", !process.env.CODEX_HOME || path.resolve(process.env.CODEX_HOME).startsWith("/paperclip/")],
@@ -237,7 +244,8 @@ step_snapshot() { # from the STILL-RUNNING original container; nothing is redepl
   [[ "$(cat "$OUT/snapshot-db-time.txt")" =~ $ISO_TS_RE ]] || die "DB timestamp missing or not ISO UTC"
   { shape_sh; db_sh; printf 'node /tmp/wp16-db.cjs runlogs %s/data/run-logs || die "runlog reconciliation failed"\n' "$I"
     inventory_sh; cat <<'EOF'
-tar -C / -czf /tmp/wp16.tgz paperclip/instances/default/data/run-logs paperclip/instances/default/logs || die "tar failed"
+tar -C / -czf /tmp/wp16.tgz paperclip/instances/default/data/run-logs paperclip/instances/default/logs paperclip/instances/default/workspaces || die "tar failed"
+echo "WP16_WSDIRS $(cd /paperclip/instances/default/workspaces && find . -mindepth 1 -type d | LC_ALL=C sort | tr '\n' ' ')"
 h="$(sha256sum /tmp/wp16.tgz)" || die "archive hash failed"
 echo "WP16_INFO archive_sha256 ${h%% *}"
 echo "WP16_B64_BEGIN"; base64 /tmp/wp16.tgz || die "base64 failed"; echo "WP16_B64_END"
@@ -247,6 +255,7 @@ EOF
   block INV "$OUT/snapshot.txt" > "$OUT/inventory-before.txt"
   grep -q '/data/run-logs/' "$OUT/inventory-before.txt" || die "inventory has no run-log files"
   block MISS "$OUT/snapshot.txt" > "$OUT/runlog-missing-before.txt"
+  grep '^WP16_WSDIRS' "$OUT/snapshot.txt" > "$OUT/wsdirs-before.txt" || die "workspace dir list missing"
   grep '^WP16_INFO runlog_rows' "$OUT/snapshot.txt" > "$OUT/runlog-counts-before.txt"
   want="$(sed -n 's/^WP16_INFO archive_sha256 //p' "$OUT/snapshot.txt")"
   [ -n "$want" ] || die "remote archive sha256 missing"
@@ -334,6 +343,8 @@ h="$(sha256sum /tmp/wp16.tgz)" || die "hash failed"
 rm -rf /tmp/wp16-x && mkdir /tmp/wp16-x && tar -C /tmp/wp16-x -xzf /tmp/wp16.tgz || die "extract failed"
 cp -a /tmp/wp16-x/paperclip/instances/default/data/run-logs/. "$I/data/run-logs/" || die "copy run-logs failed"
 # Old server logs go beside the new server's live log, never over it.
+mkdir -p "$I/workspaces" && cp -a /tmp/wp16-x/paperclip/instances/default/workspaces/. "$I/workspaces/" || die "copy workspaces failed"
+echo "WP16_WSDIRS $(cd "$I/workspaces" && find . -mindepth 1 -type d | LC_ALL=C sort | tr '\n' ' ')"
 mkdir -p "$I/logs/pre-wp16" && cp -a /tmp/wp16-x/paperclip/instances/default/logs/. "$I/logs/pre-wp16/" || die "copy logs failed"
 chown -R -h node:node /paperclip || die "chown failed"
 find "$I/data/storage" -type f > /tmp/wp16-st || die "find failed"
@@ -348,6 +359,7 @@ EOF
     db_sh; printf 'node /tmp/wp16-db.cjs runlogs %s/data/run-logs || die "runlog reconciliation failed"\n' "$I"
   } | remote restore "$OUT/restore.txt"
   block INV "$OUT/restore.txt" > "$OUT/inventory-restored.txt"
+  grep '^WP16_WSDIRS' "$OUT/restore.txt" | diff "$OUT/wsdirs-before.txt" - > /dev/null || die "workspace dirs differ after restore"
   diff "$OUT/inventory-before.txt" "$OUT/inventory-restored.txt" > "$OUT/restore.diff" \
     || die "restored files differ from the snapshot (see restore.diff)"
   block MISS "$OUT/restore.txt" > "$OUT/runlog-missing-after.txt"
@@ -389,7 +401,7 @@ EOF
 
 step_rollback() {
   say "Triggers: any failure in attach, verify-runtime, restore, probe-plant or probe-check."
-  say "Bounded loss: run-log history only. Postgres is untouched (external, daily backups + PITR); the master key is a pinned variable."
+  say "Bounded loss: run-log history only. Postgres is untouched (external, daily backups + PITR); no secrets are stored yet."
   say "Previous deployment (rollback target):"
   sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' "$OUT/deployments-before.json" | head -n 1
   say "If the WP-16 image booted at least once, the volume is node-owned and the old USER node image can use it."

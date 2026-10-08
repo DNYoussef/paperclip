@@ -12,7 +12,9 @@ The script is written for the production shape measured on 2026-10-07:
 
 - only `instances/default/{data/backups, data/run-logs, logs, workspaces (empty)}`
 - no config.json, .env, secrets/ or data/storage, and therefore no attachments
-- Postgres is external, and the master key comes from its pinned variable
+- Postgres is external. There is no master key variable or key file and no
+  stored secret (measured 2026-10-08), so no key material moves; a key
+  created later lands on the volume and persists
 
 `preflight` asserts exactly that shape. If anything differs, it aborts with
 "shape changed, re-plan". Do not adapt the script on the fly; re-plan instead.
@@ -50,8 +52,8 @@ that its groups equal node's groups, and that HOME is `/paperclip`. It also
 does a write test as node in `data/run-logs`.
 
 `rollback`: use it on any failure from `attach` onward. Possible loss is
-limited to run-log history; Postgres is untouched and the master key is a
-pinned variable. The previous deployment id comes from `record`. Redeploy it
+limited to run-log history; Postgres is untouched and no secrets are
+stored yet. The previous deployment id comes from `record`. Redeploy it
 from the Railway dashboard (the CLI only redeploys the latest). Once the
 WP-16 image has booted, the volume is node-owned and the old `USER node`
 image can use it. If the WP-16 image never booted, detach the volume first.
