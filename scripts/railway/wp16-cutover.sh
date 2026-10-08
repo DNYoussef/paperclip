@@ -34,6 +34,9 @@ confirm() {
 # stdin forwarding). railway ssh silently drops a command line over about
 # 8 KiB (measured 2026-10-08: 8101 chars arrive, 8301 do not), so the base64
 # goes up in 6000-char pieces and its sha256 is checked before it runs.
+# The step writes to a file that is then cat'ed: node's process.exit() drops
+# buffered output written straight to the ssh tty (measured 2026-10-08:
+# 8129 of 12000 lines arrived; via a file all 40000 did, in order).
 # A step counts as done only if its last output line is
 # "WP16_REMOTE_OK <step>". CRs from a pty are stripped.
 remote() {
