@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
-# WP-16 cutover: move Paperclip state from the image filesystem onto a Railway
-# volume mounted at /paperclip. Run by the owner from Git Bash, one step at a
-# time, in the order printed by `help`. Every step fails closed.
+# WP-16 cutover: put Paperclip's run logs on a Railway volume at /paperclip.
 #
-# Never prints environment values: remote scripts report variable NAMES and
-# set/unset only, and archive/base64 data goes to files, never the terminal.
+# Written for the shape measured on 2026-10-07 and nothing else. Preflight
+# asserts that shape and aborts with "shape changed, re-plan" if it differs.
+#   /paperclip/instances/default/{data/{backups,run-logs},logs,workspaces(empty)}
+#   no config.json, .env, secrets/ or data/storage; Postgres external; master
+#   key from its pinned variable.
+# Migrated set: data/run-logs and logs. data/backups is NOT migrated (see
+# README). Run from Git Bash, one step at a time, in the order of `help`.
 #
-#   SVC=<service> OUT=<dir> scripts/railway/wp16-cutover.sh <step>
+# Never prints environment values: remote steps print verdicts, counts,
+# booleans and paths only; archive data goes to files, never the terminal.
+#
+#   SVC=<service> OUT=<private local dir outside the repo> wp16-cutover.sh <step>
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 
 SVC="${SVC:?set SVC to the Railway service name}"
-OUT="${OUT:?set OUT to a local directory outside the repo for cutover state}"
-STATE_DIR=/paperclip
+OUT="${OUT:?set OUT to a private local directory outside the repo}"
+I=/paperclip/instances/default
 mkdir -p "$OUT"
 
 say() { printf '%s\n' "$*"; }
@@ -20,297 +26,358 @@ die() { printf 'WP16_FAIL: %s\n' "$*" >&2; exit 1; }
 confirm() {
   printf '\nOWNER STEP: %s\nType yes when done: ' "$1"
   local a; read -r a < /dev/tty
-  [ "$a" = yes ] || die "owner step not confirmed: $1"
+  [ "$a" = yes ] || die "owner step not confirmed"
 }
 
-# remote <step> <outfile>  (remote POSIX sh script on stdin)
-# The script is shipped as one base64 argument, so no quoting survives the
-# ssh hop and stdin forwarding is not needed. A remote step counts as done only
-# if its last line is "WP16_REMOTE_OK <step>"; exit codes through the Railway
-# CLI are not trusted alone. Output may carry CRs from a pty; they are stripped.
+# remote <step> <outfile>, remote POSIX sh script on stdin.
+# The script travels as one base64 argument (no quoting across the ssh hop, no
+# stdin forwarding). Windows caps a command line near 32 KiB, so the argument
+# is size-checked. A step counts as done only if its last output line is
+# "WP16_REMOTE_OK <step>". CRs from a pty are stripped.
 remote() {
   local step="$1" out="$2" b64
   b64="$( { printf 'set -eu\ndie() { echo "WP16_ERR $*"; exit 1; }\n'; cat; printf '\necho "WP16_REMOTE_OK %s"\n' "$step"; } | base64 -w0)"
+  [ "${#b64}" -lt 30000 ] || die "remote script for $step too long for one command line (${#b64})"
   if ! railway ssh -s "$SVC" -- "echo $b64 | base64 -d > /tmp/wp16-step.sh && sh /tmp/wp16-step.sh" > "$out.raw" 2> "$out.err"; then
-    grep -E '^WP16_(ERR|WARN)' "$out.raw" | tr -d '\r' >&2 || true
+    tr -d '\r' < "$out.raw" | grep -E '^WP16_(ERR|WARN)' >&2 || true
     die "railway ssh failed in step $step (stderr in $out.err)"
   fi
   tr -d '\r' < "$out.raw" > "$out"; rm -f "$out.raw"
   grep -E '^WP16_(ERR|WARN|INFO)' "$out" || true
   [ "$(tail -n 1 "$out")" = "WP16_REMOTE_OK $step" ] || die "remote step $step did not complete"
 }
+block() { # block <NAME> <file> -> lines between WP16_<NAME>_BEGIN/END
+  sed -n "/^WP16_$1_BEGIN\$/,/^WP16_$1_END\$/p" "$2" | sed '1d;$d'
+}
 
-# Shared remote JS: DB access through the server's own postgres client, read-only.
-db_js_prelude() {
-  cat <<'JS'
+# ---- remote building blocks (POSIX sh, sent inside remote scripts) ----
+
+# Read-only DB helper: node /tmp/wp16-db.cjs <mode> [arg]; uses the server's own
+# postgres client and a READ ONLY transaction.
+db_sh() {
+  cat <<'EOF'
+cat > /tmp/wp16-db.cjs <<'JS'
 const postgres = require(require.resolve("postgres", { paths: ["/app/packages/db"] }));
-const fs = require("fs");
-const cfgPath = process.env.PAPERCLIP_CONFIG || "/paperclip/instances/default/config.json";
-let cfg = {};
-try { cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8")); } catch { console.log("WP16_WARN config unreadable"); }
-const url = process.env.DATABASE_URL || (cfg.database && cfg.database.mode === "postgres" ? cfg.database.connectionString : undefined);
-if (!url) { console.log("WP16_ERR no external database (embedded Postgres is not supported by this cutover)"); process.exit(1); }
-const sql = postgres(url, { max: 1, onnotice: () => {} });
-const ro = (fn) => sql.begin("read only", fn);
+const fs = require("fs"), path = require("path");
+if (!process.env.DATABASE_URL) { console.log("WP16_ERR DATABASE_URL not set; shape changed, re-plan"); process.exit(1); }
+const sql = postgres(process.env.DATABASE_URL, { max: 1, onnotice: () => {} });
+const [mode, arg] = process.argv.slice(2);
+const inside = (p) => p === "/paperclip" || p.startsWith("/paperclip/");
+const run = async (s) => {
+  if (mode === "quiesce") {
+    const [r] = await s`select
+      (select count(*)::int from heartbeat_runs where status in ('queued','running')) as live,
+      (select count(*)::int from heartbeat_runs where ${arg || null}::timestamptz is not null and created_at > ${arg || null}::timestamptz) as since,
+      now()::text as now`;
+    console.log(`WP16_INFO live_runs=${r.live} runs_created_since=${arg ? r.since : "n/a"}`);
+    console.log(`WP16_DBNOW ${r.now}`);
+    return r.live === 0 && (!arg || r.since === 0);
+  }
+  if (mode === "runlogs") {
+    const rows = await s`select log_ref from heartbeat_runs where log_store = 'local_file' and log_ref is not null`;
+    const missing = rows.filter((r) => !fs.existsSync(path.resolve(arg, r.log_ref)));
+    console.log(`WP16_INFO runlog_rows=${rows.length} present=${rows.length - missing.length} missing=${missing.length}`);
+    console.log("WP16_MISS_BEGIN"); for (const r of missing) console.log(r.log_ref); console.log("WP16_MISS_END");
+    return true;
+  }
+  if (mode === "paths") {
+    const rows = await s`
+      select 'agent-cwd ' || id as k, adapter_config->>'cwd' as p from agents where adapter_config ? 'cwd'
+      union all select 'agent-worktree ' || id, adapter_config#>>'{workspaceStrategy,worktreeParentDir}' from agents
+        where adapter_config#>>'{workspaceStrategy,worktreeParentDir}' is not null
+      union all select 'agent-codex-home ' || id, coalesce(adapter_config#>>'{env,CODEX_HOME,value}', adapter_config#>>'{env,CODEX_HOME}') from agents
+        where adapter_config#>'{env,CODEX_HOME}' is not null
+      union all select 'project-workspace ' || id, cwd from project_workspaces where cwd is not null
+      union all select 'runtime-service ' || id, cwd from workspace_runtime_services where cwd is not null
+      union all select 'project-worktree ' || id, execution_workspace_policy#>>'{workspaceStrategy,worktreeParentDir}' from projects
+        where execution_workspace_policy#>>'{workspaceStrategy,worktreeParentDir}' is not null`;
+    let bad = 0;
+    for (const { k, p } of rows) {
+      const ok = p.startsWith("/") ? inside(path.resolve(p)) : !p.split("/").includes("..");
+      if (!ok) { bad++; console.log(`WP16_ERR ${k} points outside /paperclip; shape changed, re-plan`); }
+    }
+    console.log(`WP16_INFO path_overrides=${rows.length} outside=${bad}`);
+    return bad === 0;
+  }
+  throw new Error("unknown mode");
+};
+sql.begin("read only", run)
+  .then(async (ok) => { await sql.end(); process.exit(ok ? 0 : 3); })
+  .catch((e) => { console.log("WP16_ERR db query failed: " + e.message); process.exit(1); });
 JS
+cd /app
+EOF
+}
+
+# Exact-listing assertion for the original container.
+shape_sh() {
+  cat <<'EOF'
+I=/paperclip/instances/default
+want_ls() {
+  LC_ALL=C ls -A "$1" > /tmp/wp16-ls || die "cannot list $1; shape changed, re-plan"
+  got="$(tr '\n' ' ' < /tmp/wp16-ls)"
+  [ "$got" = "${2:+$2 }" ] || die "shape changed, re-plan: $1 holds [$got], expected [$2]"
+}
+want_ls /paperclip instances
+want_ls /paperclip/instances default
+want_ls "$I" "data logs workspaces"
+want_ls "$I/data" "backups run-logs"
+want_ls "$I/workspaces" ""
+find /paperclip -name '.*' ! -path "$I/data/backups/*" > /tmp/wp16-hidden || die "find failed"
+[ ! -s /tmp/wp16-hidden ] || die "shape changed, re-plan: hidden files present"
+find "$I/data/run-logs" "$I/logs" ! -type f ! -type d > /tmp/wp16-odd || die "find failed"
+[ ! -s /tmp/wp16-odd ] || die "shape changed, re-plan: non-regular entries in the migrated set"
+find /paperclip -type l > /tmp/wp16-links || die "find failed"
+while IFS= read -r l; do
+  t="$(readlink -f "$l")" || die "dangling symlink $l"
+  case "$t" in /app/*) ;; *) die "shape changed, re-plan: symlink $l leaves /app" ;; esac
+done < /tmp/wp16-links
+echo "WP16_INFO shape matches the 2026-10-07 measurement"
+EOF
+}
+
+# Effective paths through the server's own config loader, with the live env.
+config_sh() {
+  cat <<'EOF'
+cat > /tmp/wp16-cfg.mjs <<'JS'
+const { loadConfig } = await import("/app/server/src/config.ts");
+const hp = await import("/app/server/src/home-paths.ts");
+const path = await import("node:path");
+const fs = await import("node:fs");
+const c = loadConfig();
+const root = "/paperclip/instances/default";
+const runLogBase = process.env.RUN_LOG_BASE_PATH ?? path.resolve(hp.resolvePaperclipInstanceRoot(), "data", "run-logs");
+const checks = [
+  ["storage provider is local_disk", c.storageProvider === "local_disk"],
+  ["storage dir is " + root + "/data/storage", c.storageLocalDiskBaseDir === root + "/data/storage"],
+  ["run-log base is " + root + "/data/run-logs", runLogBase === root + "/data/run-logs"],
+  ["master key comes from its variable", Boolean(process.env.PAPERCLIP_SECRETS_MASTER_KEY)],
+  ["no master key file", !fs.existsSync(c.secretsMasterKeyFilePath)],
+  ["external database", Boolean(process.env.DATABASE_URL)],
+  ["CODEX_HOME unset or under /paperclip", !process.env.CODEX_HOME || path.resolve(process.env.CODEX_HOME).startsWith("/paperclip/")],
+];
+let bad = 0;
+for (const [label, ok] of checks) { console.log(`WP16_INFO config ${ok ? "ok" : "MISMATCH"}: ${label}`); if (!ok) bad++; }
+console.log(`WP16_INFO db backup enabled=${c.databaseBackupEnabled} heartbeat scheduler enabled=${c.heartbeatSchedulerEnabled}`);
+if (bad) { console.log("WP16_ERR effective config differs; shape changed, re-plan"); process.exit(1); }
+JS
+cd /app
+node --import ./server/node_modules/tsx/dist/loader.mjs /tmp/wp16-cfg.mjs || die "effective config check failed"
+EOF
+}
+
+# Hash inventory of the migrated set, paths relative to /.
+inventory_sh() {
+  cat <<'EOF'
+cd /
+find paperclip/instances/default/data/run-logs paperclip/instances/default/logs -type f > /tmp/wp16-files || die "find failed"
+: > /tmp/wp16-inv
+while IFS= read -r f; do sha256sum "$f" >> /tmp/wp16-inv || die "hash failed: $f"; done < /tmp/wp16-files
+LC_ALL=C sort -k2 /tmp/wp16-inv > /tmp/wp16-inv.sorted
+echo "WP16_INV_BEGIN"; cat /tmp/wp16-inv.sorted; echo "WP16_INV_END"
+EOF
 }
 
 # ---------------------------------------------------------------- steps
 
-step_transport() { # control: the ssh hop runs a script and returns its output
+step_transport() {
   local n; n="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-  remote transport "$OUT/transport.txt" <<EOF
-echo "WP16_INFO echo $n"
-echo "WP16_INFO uid \$(id -u)"
-EOF
+  printf 'echo "WP16_INFO echo %s"\necho "WP16_INFO uid $(id -u)"\n' "$n" | remote transport "$OUT/transport.txt"
   grep -qx "WP16_INFO echo $n" "$OUT/transport.txt" || die "ssh round trip lost the nonce"
-  say "transport ok (remote uid $(sed -n 's/^WP16_INFO uid //p' "$OUT/transport.txt"))"
 }
 
-step_preflight() { # read-only: effective paths, overrides, symlinks, key, space
+step_preflight() { # read-only, original container
   step_transport
-  { cat <<'EOF'
-for n in HOME PAPERCLIP_HOME PAPERCLIP_INSTANCE_ID PAPERCLIP_CONFIG PAPERCLIP_STORAGE_PROVIDER \
-  PAPERCLIP_STORAGE_LOCAL_DIR RUN_LOG_BASE_PATH PAPERCLIP_DB_BACKUP_DIR PAPERCLIP_DB_BACKUP_ENABLED \
-  PAPERCLIP_LOG_DIR PAPERCLIP_SECRETS_MASTER_KEY_FILE PAPERCLIP_SECRETS_MASTER_KEY DATABASE_URL; do
-  if eval "[ -n \"\${$n+x}\" ]"; then echo "WP16_INFO env $n set"; else echo "WP16_INFO env $n unset"; fi
-done
-cd /app
-node - <<'JS'
-EOF
-    db_js_prelude
-    cat <<'JS'
-const path = require("path"), os = require("os"), crypto = require("crypto");
-const home = path.resolve(process.env.PAPERCLIP_HOME || "/paperclip");
-const root = path.resolve(home, "instances", process.env.PAPERCLIP_INSTANCE_ID || "default");
-const exp = (v) => (v === "~" ? os.homedir() : v && v.startsWith("~/") ? path.join(os.homedir(), v.slice(2)) : v);
-const pick = (env, file, def) => path.resolve(exp(process.env[env] ?? file ?? def));
-const real = (p) => { try { return fs.realpathSync(p); } catch { return null; } };
-const inside = (p) => p === home || p.startsWith(home + "/");
-let bad = 0;
-const check = (label, p, durable) => {
-  const r = real(p);
-  const ok = inside(p) && (r === null || inside(r));
-  console.log(`WP16_INFO path ${label} ${p} real=${r ?? "(missing)"} ${ok ? "inside" : "OUTSIDE"}`);
-  if (!ok && durable) { bad++; console.log(`WP16_ERR durable path outside ${home}: ${label}`); }
-};
-check("config", cfgPath, true);
-const storageProvider = process.env.PAPERCLIP_STORAGE_PROVIDER || cfg.storage?.provider || "local_disk";
-console.log(`WP16_INFO storage provider ${storageProvider}`);
-if (storageProvider === "local_disk")
-  check("storage", pick("PAPERCLIP_STORAGE_LOCAL_DIR", cfg.storage?.localDisk?.baseDir, path.join(root, "data/storage")), true);
-check("run-logs", path.resolve(process.env.RUN_LOG_BASE_PATH ?? path.join(root, "data/run-logs")), true);
-check("backups", pick("PAPERCLIP_DB_BACKUP_DIR", cfg.database?.backup?.dir, path.join(root, "data/backups")), true);
-check("logs", pick("PAPERCLIP_LOG_DIR", cfg.logging?.logDir, path.join(root, "logs")), false);
-check("workspaces", path.join(root, "workspaces"), true);
-const keyFile = pick("PAPERCLIP_SECRETS_MASTER_KEY_FILE", cfg.secrets?.localEncrypted?.keyFilePath, path.join(root, "secrets/master.key"));
-console.log(`WP16_INFO master key from variable: ${process.env.PAPERCLIP_SECRETS_MASTER_KEY ? "yes" : "no"}`);
-if (fs.existsSync(keyFile)) {
-  const fp = crypto.createHash("sha256").update(fs.readFileSync(keyFile)).digest("hex").slice(0, 16);
-  console.log(`WP16_INFO master key file fingerprint sha256:${fp}`);
-  check("master-key-file", keyFile, true);
-} else console.log("WP16_INFO master key file absent");
-(async () => {
-  const rows = await ro((s) => s`
-    select 'project_workspace' as kind, cwd from project_workspaces where cwd is not null
-    union select 'agent_cwd', adapter_config->>'cwd' from agents where adapter_config ? 'cwd'`);
-  for (const { kind, cwd } of rows) {
-    const p = path.resolve(exp(cwd));
-    if (real(p) === null) { console.log(`WP16_WARN ${kind} ${p} does not exist in this container`); continue; }
-    check(kind, p, true);
-  }
-  await sql.end();
-  if (bad) process.exit(1);
-})().catch((e) => { console.log("WP16_ERR db query failed: " + e.message); process.exit(1); });
-JS
-    cat <<'EOF'
-JS
-find /paperclip -type l > /tmp/wp16-links || die "find symlinks failed"
-out=0
-while IFS= read -r l; do
-  t="$(readlink -f "$l")" || t="(dangling)"
-  case "$t" in /paperclip|/paperclip/*) ;; *) echo "WP16_ERR symlink $l points outside /paperclip"; out=1 ;; esac
-done < /tmp/wp16-links
-[ "$out" = 0 ] || die "symlinks leave /paperclip"
-du -sk /paperclip > /tmp/wp16-du || die "du failed"
-df -Pk /tmp > /tmp/wp16-df || die "df failed"
-used="$(cut -f1 /tmp/wp16-du)"
-avail="$(awk 'NR==2 {print $4}' /tmp/wp16-df)"
-echo "WP16_INFO size kib used=$used tmp_avail=$avail"
-[ "$avail" -gt "$used" ] || die "not enough space in /tmp for the archive"
-EOF
-  } | remote preflight "$OUT/preflight.txt"
-  say "preflight passed; report in $OUT/preflight.txt"
+  { shape_sh; config_sh; db_sh; echo 'node /tmp/wp16-db.cjs paths || die "path overrides leave /paperclip"'; } \
+    | remote preflight "$OUT/preflight.txt"
+  say "preflight passed"
 }
 
-step_record() { # rollback facts: deployments and variable NAMES only
+step_record() { # rollback facts; variable NAMES only (values pass through cut, never stored)
   railway deployment list -s "$SVC" --limit 5 --json > "$OUT/deployments-before.json"
-  # --kv prints values; only the name column is kept and nothing is echoed.
   railway variable list -s "$SVC" --kv | cut -d= -f1 | LC_ALL=C sort > "$OUT/variable-names-before.txt"
   [ -s "$OUT/variable-names-before.txt" ] || die "no variable names recorded"
-  railway volume list --json > "$OUT/volumes-before.json"
-  say "recorded: $OUT/deployments-before.json (first entry = rollback target), variable-names-before.txt, volumes-before.json"
+  say "recorded. Rollback target = the newest deployment in $OUT/deployments-before.json; note its id now:"
+  sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' "$OUT/deployments-before.json" | head -n 1
 }
 
-quiesce_js() {
-  printf 'cd /app\nnode - <<'"'"'JS'"'"'\n'
-  db_js_prelude
-  cat <<'JS'
-(async () => {
-  const [r] = await ro((s) => s`select
-    (select count(*)::int from heartbeat_runs where status in ('queued','running')) as live_runs,
-    (select count(*)::int from agents where status not in ('paused','terminated','pending_approval')) as unpaused`);
-  console.log(`WP16_INFO live_runs=${r.live_runs} unpaused_agents=${r.unpaused}`);
-  await sql.end();
-  if (r.live_runs !== 0 || r.unpaused !== 0) process.exit(3);
-})().catch((e) => { console.log("WP16_ERR db query failed: " + e.message); process.exit(1); });
-JS
-  printf 'JS\n'
+quiesce_once() { # quiesce_once <outfile> [since-ts]
+  { db_sh; printf 'node /tmp/wp16-db.cjs quiesce %s || die "not quiesced"\n' "${2:-}"; } | remote quiesce "$1"
 }
 
-step_quiesce() { # owner pauses the schedulers, then wait for zero live runs
-  confirm "In n8n, deactivate every Paperclip heartbeat workflow (do not delete them)."
-  confirm "In Paperclip (Agents page), pause every agent. There is no maintenance flag in this build."
+step_quiesce() {
+  confirm "In n8n, deactivate every workflow that calls the Paperclip API (agent heartbeats/wakeups). Do not delete them. Keep the list; you re-activate exactly these at the end."
   local i
   for i in $(seq 1 60); do
-    if quiesce_js | remote quiesce "$OUT/quiesce.txt" 2>/dev/null; then
-      say "quiesced: no live runs, all agents paused"; return 0
-    fi
+    if (quiesce_once "$OUT/quiesce.txt") 2>/dev/null; then say "quiesced: zero queued or running heartbeat runs"; return 0; fi
     sleep 10
   done
-  die "still live runs or unpaused agents after 10 minutes (see $OUT/quiesce.txt)"
+  die "runs still live after 10 minutes (see $OUT/quiesce.txt)"
 }
 
-# Inventory of every regular file under /paperclip: "sha256  relative/path".
-inventory_sh() {
-  cat <<'EOF'
-cd /
-find paperclip -type f ! -path 'paperclip/.wp16-*' > /tmp/wp16-files || die "find failed"
-: > /tmp/wp16-inv
-while IFS= read -r f; do sha256sum "$f" >> /tmp/wp16-inv || die "hash failed"; done < /tmp/wp16-files
-LC_ALL=C sort -k2 /tmp/wp16-inv > /tmp/wp16-inv.sorted
-[ -s /tmp/wp16-inv.sorted ] || die "empty inventory"
-echo "WP16_INV_BEGIN"; cat /tmp/wp16-inv.sorted; echo "WP16_INV_END"
-EOF
-}
-extract_inv() { # extract_inv <remote-output> <dest>; strips the probe file
-  sed -n '/^WP16_INV_BEGIN$/,/^WP16_INV_END$/p' "$1" | sed '1d;$d' | { grep -v '/\.persist-probe$' || true; } > "$2"
-  [ -s "$2" ] || die "empty inventory in $1"
-}
-
-step_snapshot() { # from the STILL-RUNNING original container; no redeploy before this
-  quiesce_js | remote quiesce "$OUT/quiesce.txt"
-  { inventory_sh; cat <<'EOF'
-tar -C / -czf /tmp/wp16.tgz paperclip || die "tar failed"
+step_snapshot() { # from the STILL-RUNNING original container; nothing is redeployed before this
+  quiesce_once "$OUT/quiesce.txt"
+  sed -n 's/^WP16_DBNOW //p' "$OUT/quiesce.txt" > "$OUT/snapshot-db-time.txt"
+  [ -s "$OUT/snapshot-db-time.txt" ] || die "no DB timestamp"
+  { shape_sh; db_sh; printf 'node /tmp/wp16-db.cjs runlogs %s/data/run-logs || die "runlog reconciliation failed"\n' "$I"
+    inventory_sh; cat <<'EOF'
+tar -C / -czf /tmp/wp16.tgz paperclip/instances/default/data/run-logs paperclip/instances/default/logs || die "tar failed"
 h="$(sha256sum /tmp/wp16.tgz)" || die "archive hash failed"
 echo "WP16_INFO archive_sha256 ${h%% *}"
 echo "WP16_B64_BEGIN"; base64 /tmp/wp16.tgz || die "base64 failed"; echo "WP16_B64_END"
 EOF
   } | remote snapshot "$OUT/snapshot.txt"
   local want got
-  extract_inv "$OUT/snapshot.txt" "$OUT/inventory-before.txt"
+  block INV "$OUT/snapshot.txt" > "$OUT/inventory-before.txt"
+  grep -q '/data/run-logs/' "$OUT/inventory-before.txt" || die "inventory has no run-log files"
+  block MISS "$OUT/snapshot.txt" > "$OUT/runlog-missing-before.txt"
+  grep '^WP16_INFO runlog_rows' "$OUT/snapshot.txt" > "$OUT/runlog-counts-before.txt"
   want="$(sed -n 's/^WP16_INFO archive_sha256 //p' "$OUT/snapshot.txt")"
   [ -n "$want" ] || die "remote archive sha256 missing"
-  sed -n '/^WP16_B64_BEGIN$/,/^WP16_B64_END$/p' "$OUT/snapshot.txt" | sed '1d;$d' | base64 -d > "$OUT/paperclip.tgz"
-  rm -f "$OUT/snapshot.txt"   # held the base64 archive (secrets); keep only the binary
-  got="$(sha256sum "$OUT/paperclip.tgz" | cut -d' ' -f1)"
+  block B64 "$OUT/snapshot.txt" | base64 -d > "$OUT/paperclip-runlogs.tgz"
+  rm -f "$OUT/snapshot.txt"
+  got="$(sha256sum "$OUT/paperclip-runlogs.tgz" | cut -d' ' -f1)"
   [ "$got" = "$want" ] || die "archive sha256 mismatch: remote $want local $got"
-  printf '%s  paperclip.tgz\n' "$got" > "$OUT/paperclip.tgz.sha256"
-  # Every inventoried file must be in the archive.
-  tar -tzf "$OUT/paperclip.tgz" | LC_ALL=C sort > "$OUT/archive-list.txt"
+  printf '%s  paperclip-runlogs.tgz\n' "$got" > "$OUT/paperclip-runlogs.tgz.sha256"
+  tar -tzf "$OUT/paperclip-runlogs.tgz" | LC_ALL=C sort > "$OUT/archive-list.txt"
   cut -c67- "$OUT/inventory-before.txt" | LC_ALL=C sort | comm -23 - "$OUT/archive-list.txt" > "$OUT/missing-from-archive.txt"
-  [ ! -s "$OUT/missing-from-archive.txt" ] || die "archive lacks inventoried files (see missing-from-archive.txt)"
-  say "snapshot ok: $(wc -l < "$OUT/inventory-before.txt") files, sha256 $got"
-  say "keep $OUT/paperclip.tgz and its .sha256 off the service until WP-16 is closed"
+  [ ! -s "$OUT/missing-from-archive.txt" ] || die "archive lacks inventoried files"
+  say "snapshot ok: $(wc -l < "$OUT/inventory-before.txt") files, sha256 $got; $(cat "$OUT/runlog-counts-before.txt")"
 }
 
-step_attach() { # variable, volume, new image; agents stay paused throughout
-  [ -s "$OUT/paperclip.tgz.sha256" ] || die "no verified snapshot; run snapshot first"
+step_recheck() { # right before attach: nothing new in the original since the snapshot
+  quiesce_once "$OUT/recheck-quiesce.txt" "$(cat "$OUT/snapshot-db-time.txt")"
+  { shape_sh; inventory_sh; } | remote recheck "$OUT/recheck.txt"
+  block INV "$OUT/recheck.txt" > "$OUT/inventory-recheck.txt"
+  # run-logs must be byte-identical; server logs may have grown (health probes), same file set.
+  diff <(grep '/data/run-logs/' "$OUT/inventory-before.txt") <(grep '/data/run-logs/' "$OUT/inventory-recheck.txt") > "$OUT/recheck.diff" \
+    || die "run logs changed after the snapshot (see recheck.diff); re-run snapshot"
+  diff <(grep '/logs/' "$OUT/inventory-before.txt" | cut -c67-) <(grep '/logs/' "$OUT/inventory-recheck.txt" | cut -c67-) >> "$OUT/recheck.diff" \
+    || die "log file set changed after the snapshot; re-run snapshot"
+  say "recheck ok: no new runs, run logs unchanged"
+}
+
+step_attach() { # new image + volume + backups off, heartbeats still paused (= restore-only mode)
+  [ -s "$OUT/paperclip-runlogs.tgz.sha256" ] || die "no verified snapshot"
   railway variable set -s "$SVC" --skip-deploys PAPERCLIP_DB_BACKUP_ENABLED=false > /dev/null
-  # New image first (snapshot is safe locally), so the old USER-node image never
-  # boots on a root-owned volume.
-  confirm "Deploy the WP-16 image commit to $SVC (merge to its deploy branch). Leave n8n heartbeats and agents PAUSED. Wait until the deployment is Active."
-  railway volume -s "$SVC" add -m "$STATE_DIR" --json > "$OUT/volume-add.json"
-  say "volume created; ids in $OUT/volume-add.json"
-  confirm "Wait until the redeploy that attaching the volume triggers is Active (agents still paused)."
+  railway volume -s "$SVC" add -m /paperclip --json > "$OUT/volume-add.json"
+  confirm "Deploy the WP-16 image commit to $SVC (merge to its deploy branch). n8n heartbeats stay paused. Wait until the deployment is Active."
+  step_verify_runtime
+}
+
+step_verify_runtime() { # the image-level privilege-drop test; only possible on the live container
   step_transport
-  grep -qx 'WP16_INFO uid 0' "$OUT/transport.txt" || die "new container shell is not root; is the WP-16 image live?"
+  cat <<'EOF' | remote verify-runtime "$OUT/verify-runtime.txt"
+u="$(id -u node)"; g="$(id -g node)"; gs="$(id -G node)"
+want_grps="$(printf '%s\n' $gs | sort -n | tr '\n' ' ')"
+# The server process(es): match the image CMD exactly, not this script or grep.
+pids=""
+for d in /proc/[0-9]*; do
+  c="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" || continue
+  case "$c" in "node --import ./server/node_modules/tsx/dist/loader.mjs server/src/index.ts"*) pids="$pids ${d#/proc/}" ;; esac
+done
+[ -n "$pids" ] || die "server process not found"
+for p in $pids; do
+  st="$(cat "/proc/$p/status")" || die "cannot read /proc/$p/status"
+  uids="$(printf '%s\n' "$st" | awk '/^Uid:/ {print $2, $3, $4, $5}')"
+  gids="$(printf '%s\n' "$st" | awk '/^Gid:/ {print $2, $3, $4, $5}')"
+  grps="$(printf '%s\n' "$st" | awk '/^Groups:/ {$1=""; print}' | tr ' ' '\n' | grep . | sort -n | tr '\n' ' ')"
+  [ "$uids" = "$u $u $u $u" ] || die "server pid $p uids [$uids] are not all node ($u)"
+  [ "$gids" = "$g $g $g $g" ] || die "server pid $p gids [$gids] are not all node ($g)"
+  [ "$grps" = "$want_grps" ] || die "server pid $p groups [$grps] differ from node's [$want_grps]"
+  tr '\0' '\n' < "/proc/$p/environ" | grep -qx 'HOME=/paperclip' || die "server pid $p HOME is not /paperclip"
+done
+f=/paperclip/instances/default/data/run-logs/.wp16-write-test
+setpriv --reuid=node --regid=node --init-groups -- sh -c "echo ok > $f && rm -f $f" || die "write test as node failed"
+echo "WP16_INFO server pid(s)$pids run as node uid=$u gid=$g groups=[$want_grps]; HOME ok; run-logs writable as node"
+EOF
 }
 
-step_restore() { # upload, verify hash, replace volume contents, verify inventory, write test
-  [ -s "$OUT/volume-add.json" ] || die "no volume-add.json; run attach first"
-  [ -s "$OUT/paperclip.tgz.sha256" ] || die "no verified snapshot; run snapshot first"
-  quiesce_js | remote quiesce "$OUT/quiesce.txt"
-  local vol sha
-  vol="$(sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' "$OUT/volume-add.json" | head -n 1)"
-  [ -n "$vol" ] || die "volume id not found in volume-add.json"
-  sha="$(cut -d' ' -f1 "$OUT/paperclip.tgz.sha256")"
-  ( cd "$OUT" && sha256sum -c paperclip.tgz.sha256 > /dev/null ) || die "local archive changed since snapshot"
-  railway volume files upload -v "$vol" --overwrite "$OUT/paperclip.tgz" /.wp16-restore.tgz > /dev/null
-  { cat <<EOF
-want=$sha
+step_restore() { # empty volume only; checked base64 transfer in chunks
+  [ -s "$OUT/paperclip-runlogs.tgz.sha256" ] || die "no verified snapshot"
+  ( cd "$OUT" && sha256sum -c paperclip-runlogs.tgz.sha256 > /dev/null ) || die "local archive changed since snapshot"
+  quiesce_once "$OUT/restore-quiesce.txt"
+  cat <<'EOF' | remote restore-precheck "$OUT/restore-precheck.txt"
+I=/paperclip/instances/default
+find /paperclip -type f ! -path "$I/logs/*" > /tmp/wp16-present || die "find failed"
+[ ! -s /tmp/wp16-present ] || die "volume is not empty outside logs/; refusing to restore over it"
+rm -f /tmp/wp16-up.b64
 EOF
-    cat <<'EOF'
-a=/paperclip/.wp16-restore.tgz
-h="$(sha256sum "$a")" || die "hash of upload failed"
+  local sha chunk; sha="$(cut -d' ' -f1 "$OUT/paperclip-runlogs.tgz.sha256")"
+  { base64 -w0 "$OUT/paperclip-runlogs.tgz"; echo; } | fold -w 18000 > "$OUT/upload.b64"
+  while IFS= read -r chunk; do
+    printf "printf '%%s' '%s' >> /tmp/wp16-up.b64\n" "$chunk" | remote upload "$OUT/upload.txt"
+  done < "$OUT/upload.b64"
+  { printf 'want=%s\n' "$sha"; cat <<'EOF'
+I=/paperclip/instances/default
+base64 -d /tmp/wp16-up.b64 > /tmp/wp16.tgz || die "decode failed"
+h="$(sha256sum /tmp/wp16.tgz)" || die "hash failed"
 [ "${h%% *}" = "$want" ] || die "uploaded archive sha256 mismatch"
-find /paperclip -mindepth 1 -maxdepth 1 ! -name .wp16-restore.tgz -exec rm -rf {} + || die "clearing volume failed"
-tar -C / -xzf "$a" || die "extract failed"
-rm -f "$a"
+rm -rf /tmp/wp16-x && mkdir /tmp/wp16-x && tar -C /tmp/wp16-x -xzf /tmp/wp16.tgz || die "extract failed"
+cp -a /tmp/wp16-x/paperclip/instances/default/data/run-logs/. "$I/data/run-logs/" || die "copy run-logs failed"
+# Old server logs go beside the new server's live log, never over it.
+mkdir -p "$I/logs/pre-wp16" && cp -a /tmp/wp16-x/paperclip/instances/default/logs/. "$I/logs/pre-wp16/" || die "copy logs failed"
 chown -R -h node:node /paperclip || die "chown failed"
-setpriv --reuid=node --regid=node --init-groups -- sh -c 't=/paperclip/instances/default/data/storage/.wp16-write-test; echo ok > "$t" && rm -f "$t"' \
-  || die "write test as node failed"
-echo "WP16_INFO write test as node ok"
+find "$I/data/storage" -type f > /tmp/wp16-st || die "find failed"
+[ ! -s /tmp/wp16-st ] || die "data/storage has files; shape changed, re-plan"
+cd /
+: > /tmp/wp16-inv
+find paperclip/instances/default/data/run-logs paperclip/instances/default/logs/pre-wp16 -type f > /tmp/wp16-files || die "find failed"
+while IFS= read -r f; do sha256sum "$f" >> /tmp/wp16-inv || die "hash failed"; done < /tmp/wp16-files
+echo "WP16_INV_BEGIN"; sed 's#paperclip/instances/default/logs/pre-wp16/#paperclip/instances/default/logs/#' /tmp/wp16-inv | LC_ALL=C sort -k2; echo "WP16_INV_END"
+rm -rf /tmp/wp16-x /tmp/wp16.tgz /tmp/wp16-up.b64
 EOF
-    inventory_sh
+    db_sh; printf 'node /tmp/wp16-db.cjs runlogs %s/data/run-logs || die "runlog reconciliation failed"\n' "$I"
   } | remote restore "$OUT/restore.txt"
-  extract_inv "$OUT/restore.txt" "$OUT/inventory-restored.txt"
+  block INV "$OUT/restore.txt" > "$OUT/inventory-restored.txt"
   diff "$OUT/inventory-before.txt" "$OUT/inventory-restored.txt" > "$OUT/restore.diff" \
-    || die "restored inventory differs from snapshot (see restore.diff)"
-  say "restore verified: every file matches the pre-cutover inventory"
-  confirm "Redeploy $SVC once (railway redeploy -s $SVC -y) so the server boots on the restored state. Keep agents paused. Wait for Active."
+    || die "restored files differ from the snapshot (see restore.diff)"
+  block MISS "$OUT/restore.txt" > "$OUT/runlog-missing-after.txt"
+  say "before: $(cat "$OUT/runlog-counts-before.txt")"
+  say "after:  $(grep '^WP16_INFO runlog_rows' "$OUT/restore.txt")"
+  LC_ALL=C sort "$OUT/runlog-missing-before.txt" > "$OUT/mb"; LC_ALL=C sort "$OUT/runlog-missing-after.txt" > "$OUT/ma"
+  comm -13 "$OUT/mb" "$OUT/ma" > "$OUT/runlog-new-misses.txt"
+  [ ! -s "$OUT/runlog-new-misses.txt" ] || die "$(wc -l < "$OUT/runlog-new-misses.txt") run logs referenced by the DB are newly missing"
+  say "restore verified: every hash matches, no new run-log misses vs baseline"
 }
-
-durable() { grep -v -E '  paperclip/instances/[^/]+/logs/' "$1"; } # server logs are appended on boot
 
 step_probe_plant() {
-  step_transport
   local nonce; nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
   printf '%s\n' "$nonce" > "$OUT/probe-nonce.txt"
-  { cat <<EOF
-setpriv --reuid=node --regid=node --init-groups -- sh -c 'echo $nonce > /paperclip/instances/default/data/storage/.persist-probe' || die "probe write as node failed"
-EOF
-    inventory_sh
-  } | remote probe-plant "$OUT/probe-plant.txt"
-  extract_inv "$OUT/probe-plant.txt" "$OUT/inventory-before-redeploy.txt"
-  diff <(durable "$OUT/inventory-before.txt") <(durable "$OUT/inventory-before-redeploy.txt") > "$OUT/boot.diff" \
-    || die "durable files changed across the restore boot (see boot.diff)"
-  confirm "Redeploy $SVC again (railway redeploy -s $SVC -y). Wait for Active."
+  printf 'setpriv --reuid=node --regid=node --init-groups -- sh -c "echo %s > %s/data/storage/.persist-probe" || die "probe write failed"\n' "$nonce" "$I" \
+    | remote probe-plant "$OUT/probe-plant.txt"
+  confirm "Redeploy $SVC (railway redeploy -s $SVC -y). Heartbeats stay paused. Wait for Active."
 }
 
 step_probe_check() {
   [ -s "$OUT/probe-nonce.txt" ] || die "no probe nonce; run probe-plant first"
   local nonce; nonce="$(cat "$OUT/probe-nonce.txt")"
-  { printf 'echo "WP16_INFO probe $(cat /paperclip/instances/default/data/storage/.persist-probe)"\n'; inventory_sh; } \
-    | remote probe-check "$OUT/probe-check.txt"
-  grep -qx "WP16_INFO probe $nonce" "$OUT/probe-check.txt" || die "probe content lost across redeploy"
-  extract_inv "$OUT/probe-check.txt" "$OUT/inventory-after.txt"
-  diff <(durable "$OUT/inventory-before.txt") <(durable "$OUT/inventory-after.txt") > "$OUT/persist.diff" \
-    || die "durable files differ after redeploy (see persist.diff)"
-  grep -qE '  paperclip/instances/[^/]+/data/storage/' "$OUT/inventory-after.txt" || say "WARN: no attachment files in inventory"
-  grep -qE '  paperclip/instances/[^/]+/data/run-logs/' "$OUT/inventory-after.txt" || say "WARN: no run-log files in inventory"
+  { printf 'p="$(cat %s/data/storage/.persist-probe)" || die "probe missing"\necho "WP16_PROBE $p"\nrm -f %s/data/storage/.persist-probe\n' "$I" "$I"
+    cat <<'EOF'
+cd /
+find paperclip/instances/default/data/run-logs paperclip/instances/default/logs/pre-wp16 -type f > /tmp/wp16-files || die "find failed"
+: > /tmp/wp16-inv
+while IFS= read -r f; do sha256sum "$f" >> /tmp/wp16-inv || die "hash failed"; done < /tmp/wp16-files
+echo "WP16_INV_BEGIN"; sed 's#paperclip/instances/default/logs/pre-wp16/#paperclip/instances/default/logs/#' /tmp/wp16-inv | LC_ALL=C sort -k2; echo "WP16_INV_END"
+EOF
+  } | remote probe-check "$OUT/probe-check.txt"
+  grep -qx "WP16_PROBE $nonce" "$OUT/probe-check.txt" || die "probe content lost across redeploy"
+  block INV "$OUT/probe-check.txt" > "$OUT/inventory-after.txt"
+  diff "$OUT/inventory-before.txt" "$OUT/inventory-after.txt" > "$OUT/persist.diff" || die "files differ after redeploy (see persist.diff)"
+  step_verify_runtime
   say "PAPERCLIP_STATE_PERSISTS"
-  say "Owner: resume agents in Paperclip, then re-activate the n8n heartbeat workflows."
+  say "Owner: re-activate exactly the n8n workflows deactivated in the quiesce step."
 }
 
 step_rollback() {
-  local prev; prev="$(sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' "$OUT/deployments-before.json" | head -n 1)"
-  [ -n "$prev" ] || die "no recorded previous deployment"
-  say "Rollback triggers: any verification, health or write-test failure in steps restore/probe-plant/probe-check."
-  say "Volume ownership is already node:node (restore ran chown -R -h), so the old USER node image can use it."
-  confirm "In Railway, open deployment $prev of $SVC and choose Redeploy (the CLI only redeploys the latest). Leave the volume attached. Agents stay paused."
-  say "Snapshot kept at $OUT/paperclip.tgz ($(cut -d' ' -f1 "$OUT/paperclip.tgz.sha256"))."
-  say "To drop the volume afterwards: railway volume -s $SVC detach -v <id from $OUT/volume-add.json> (the old image then runs on its ephemeral /paperclip; restore from the archive if needed)."
+  say "Triggers: any failure in attach, verify-runtime, restore, probe-plant or probe-check."
+  say "Bounded loss: run-log history only. Postgres is untouched (external, daily backups + PITR); the master key is a pinned variable."
+  say "Previous deployment (rollback target):"
+  sed -n 's/.*"id": *"\([^"]*\)".*/\1/p' "$OUT/deployments-before.json" | head -n 1
+  say "If the WP-16 image booted at least once, the volume is node-owned and the old USER node image can use it."
+  say "If it never booted: railway volume -s $SVC detach -v <id in $OUT/volume-add.json> first."
+  confirm "In the Railway dashboard, open that deployment and choose Redeploy (the CLI only redeploys the latest)."
+  say "Archive kept at $OUT/paperclip-runlogs.tgz, sha256 $(cut -d' ' -f1 "$OUT/paperclip-runlogs.tgz.sha256")"
 }
 
 case "${1:-help}" in
@@ -319,10 +386,12 @@ case "${1:-help}" in
   record) step_record ;;
   quiesce) step_quiesce ;;
   snapshot) step_snapshot ;;
+  recheck) step_recheck ;;
   attach) step_attach ;;
+  verify-runtime) step_verify_runtime ;;
   restore) step_restore ;;
   probe-plant) step_probe_plant ;;
   probe-check) step_probe_check ;;
   rollback) step_rollback ;;
-  *) say "order: preflight record quiesce snapshot attach restore probe-plant probe-check (rollback on any failure)" ;;
+  *) say "order: preflight record quiesce snapshot recheck attach restore probe-plant probe-check (rollback on any failure)" ;;
 esac
