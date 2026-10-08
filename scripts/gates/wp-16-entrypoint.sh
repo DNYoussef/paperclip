@@ -59,6 +59,7 @@ EOF
 EOF
   echo 'exit 0' >> "$t/bin/stat"
   echo 'exit "${CHOWN_RC:-0}"' >> "$t/bin/chown"
+  echo '[ -z "${TEST_FAIL_DIR:-}" ] || [ "$2" != "$TEST_FAIL_DIR" ] || exit 1' >> "$t/bin/test"
   echo 'exit "${TEST_RC:-0}"' >> "$t/bin/test"
   cat >> "$t/bin/setpriv" <<'EOF'
 while [ "$1" != "--" ]; do shift; done; shift
@@ -92,54 +93,53 @@ elif [ "$cmd_at" != 0 ] && [ "$chown_at" -gt "$cmd_at" ]; then
   fail "ownership repair ran after CMD"
 fi
 [ "$rc" = 0 ] || fail "normal boot exited $rc"
-expected="$(cat <<EOF
-== id
+inst="$state/instances/default"
+expected="$(
+  printf '== id
 arg:-u
 arg:node
-== chown
+'
+  printf '== chown
 arg:-R
 arg:-h
 arg:node:node
-arg:$state
-== setpriv
+arg:%s
+' "$state"
+  for d in "$state" "$inst" "$inst/data/run-logs" "$inst/data/storage"; do
+    printf '== setpriv
 arg:--reuid=node
 arg:--regid=node
 arg:--init-groups
 arg:--
 arg:test
 arg:-w
-arg:$state
-== test
+arg:%s
+' "$d"
+    printf '== test
 arg:-w
-arg:$state
-== setpriv
-arg:--reuid=node
-arg:--regid=node
-arg:--init-groups
-arg:--
-arg:test
-arg:-w
-arg:$state/instances/default
-== test
-arg:-w
-arg:$state/instances/default
-== setpriv
+arg:%s
+' "$d"
+  done
+  printf '== setpriv
 arg:--reuid=node
 arg:--regid=node
 arg:--init-groups
 arg:--
 arg:fake-cmd
-$cmd_args
-== fake-cmd
-$cmd_args
-EOF
+%s
+' "$cmd_args"
+  printf '== fake-cmd
+%s
+' "$cmd_args"
 )"
 if [ "$(cat "$log")" != "$expected" ]; then
-  fail "normal boot call sequence differs (want: id, chown -R -h, setpriv-as-node writability checks, setpriv-as-node exec of the CMD with argv intact)"
+  fail "normal boot call sequence differs (want: id, chown -R -h, setpriv-as-node writability checks of state, instance, run-logs, storage, setpriv-as-node exec of the CMD with argv intact)"
   printf '%s\n' "$expected" > "$work/expected"
   diff "$work/expected" "$log" | sed 's/^/    /' | head -n 40
 fi
-[ -d "$state/instances/default" ] || fail "instance dir not created before chown"
+for d in "$inst/data/run-logs" "$inst/data/storage"; do
+  [ -d "$d" ] || fail "$d not created by the entrypoint"
+done
 
 # Case 2: chown fails -> non-zero, no setpriv, no CMD.
 CHOWN_RC=1 start_container chown-fails
@@ -151,6 +151,11 @@ grep -qxF '== fake-cmd' "$log" && fail "CMD ran after chown failed"
 TEST_RC=1 start_container not-writable
 [ "$rc" != 0 ] || fail "failing writability check still exited 0"
 grep -qxF '== fake-cmd' "$log" && fail "CMD ran although state dir is not writable as node"
+
+# Case 3b: only a descendant (storage) is not writable as node -> non-zero, no CMD.
+TEST_FAIL_DIR="$work/storage-not-writable/state/instances/default/data/storage" start_container storage-not-writable
+[ "$rc" != 0 ] || fail "unwritable storage dir still exited 0"
+grep -qxF '== fake-cmd' "$log" && fail "CMD ran although storage dir is not writable as node"
 
 # Case 4: final privilege drop fails -> non-zero, CMD never runs.
 SETPRIV_EXEC_RC=1 start_container drop-fails

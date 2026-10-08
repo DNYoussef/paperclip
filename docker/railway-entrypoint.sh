@@ -14,14 +14,16 @@ node_uid="$(id -u node)"
 [ -n "$node_uid" ] || die "could not resolve uid of node"
 [ "$node_uid" != "0" ] || die "node uid is 0, refusing"
 
-mkdir -p "$instance_dir"
+# The run-log and storage dirs are made here, so the as-node checks below
+# cover the dirs the server actually writes.
+mkdir -p "$instance_dir/data/run-logs" "$instance_dir/data/storage"
 # -R with GNU's default -P: never follow symlinks while walking; -h: re-own the
 # link itself, not its target. Exits non-zero if any entry fails.
 # ponytail: walks the whole volume on every boot. Fine at current size; if boot
 # time matters, switch to a marker file plus `find -not -user node`.
 chown -R -h node:node "$state_dir" || die "chown of $state_dir failed"
 
-for dir in "$state_dir" "$instance_dir"; do
+for dir in "$state_dir" "$instance_dir" "$instance_dir/data/run-logs" "$instance_dir/data/storage"; do
   setpriv --reuid=node --regid=node --init-groups -- test -w "$dir" \
     || die "$dir is not writable as node"
 done
