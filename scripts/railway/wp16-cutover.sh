@@ -37,16 +37,18 @@ confirm() {
 # A step counts as done only if its last output line is
 # "WP16_REMOTE_OK <step>". CRs from a pty are stripped.
 remote() {
-  local step="$1" out="$2" b64 h i=0
+  local step="$1" out="$2" b64 h i=0 d
+  # Private dir per invocation: an overlapping call cannot swap the script.
+  d="/tmp/wp16-step-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
   b64="$( { printf 'set -eu\ndie() { echo "WP16_ERR $*"; exit 1; }\n'; cat; printf '\necho "WP16_REMOTE_OK %s"\n' "$step"; } | base64 -w0)"
   h="$(printf '%s' "$b64" | sha256sum | cut -d' ' -f1)"
-  railway ssh -s "$SVC" -- "rm -f /tmp/wp16-step.b64" > /dev/null 2> "$out.err" || die "railway ssh failed in step $step (stderr in $out.err)"
+  railway ssh -s "$SVC" -- "umask 077 && mkdir $d" > /dev/null 2> "$out.err" || die "railway ssh failed in step $step (stderr in $out.err)"
   while [ "$i" -lt "${#b64}" ]; do
-    railway ssh -s "$SVC" -- "printf %s ${b64:i:6000} >> /tmp/wp16-step.b64" > /dev/null 2> "$out.err" \
+    railway ssh -s "$SVC" -- "printf %s ${b64:i:6000} >> $d/s.b64" > /dev/null 2> "$out.err" \
       || die "upload failed in step $step (stderr in $out.err)"
     i=$((i + 6000))
   done
-  if ! railway ssh -s "$SVC" -- "echo '$h  /tmp/wp16-step.b64' | sha256sum -c --status || { echo 'WP16_ERR uploaded step script hash mismatch'; exit 1; }; base64 -d /tmp/wp16-step.b64 > /tmp/wp16-step.sh && sh /tmp/wp16-step.sh" > "$out.raw" 2> "$out.err"; then
+  if ! railway ssh -s "$SVC" -- "echo '$h  $d/s.b64' | sha256sum -c --status || { echo 'WP16_ERR uploaded step script hash mismatch'; exit 1; }; base64 -d $d/s.b64 > $d/s.sh && sh $d/s.sh; r=\$?; rm -rf $d; exit \$r" > "$out.raw" 2> "$out.err"; then
     tr -d '\r' < "$out.raw" | grep -E '^WP16_(ERR|WARN)' >&2 || true
     die "railway ssh failed in step $step (stderr in $out.err)"
   fi
@@ -170,6 +172,7 @@ const checks = [
   ["storage dir is " + root + "/data/storage", c.storageLocalDiskBaseDir === root + "/data/storage"],
   ["run-log base is " + root + "/data/run-logs", runLogBase === root + "/data/run-logs"],
   ["no master key file", !fs.existsSync(c.secretsMasterKeyFilePath)],
+  ["master key path is " + root + "/secrets/master.key", c.secretsMasterKeyFilePath === root + "/secrets/master.key"],
   ["external database", Boolean(process.env.DATABASE_URL)],
   ["CODEX_HOME unset or under /paperclip", !process.env.CODEX_HOME || path.resolve(process.env.CODEX_HOME).startsWith("/paperclip/")],
 ];
@@ -229,7 +232,7 @@ quiesce_once() { # quiesce_once <outfile> [since-ts]; since-ts travels as ONE qu
 }
 
 step_quiesce() {
-  confirm "In n8n, deactivate every workflow that calls the Paperclip API (agent heartbeats/wakeups). Do not delete them. Keep the list; you re-activate exactly these at the end."
+  confirm "Heartbeat runs come from Paperclip's own timer (even ET hours, ~:35). Confirm the last batch has finished and snapshot, recheck and the image deploy will finish before the next one."
   local i
   for i in $(seq 1 60); do
     if (quiesce_once "$OUT/quiesce.txt") 2>/dev/null; then say "quiesced: zero queued or running heartbeat runs"; return 0; fi
@@ -245,7 +248,9 @@ step_snapshot() { # from the STILL-RUNNING original container; nothing is redepl
   { shape_sh; db_sh; printf 'node /tmp/wp16-db.cjs runlogs %s/data/run-logs || die "runlog reconciliation failed"\n' "$I"
     inventory_sh; cat <<'EOF'
 tar -C / -czf /tmp/wp16.tgz paperclip/instances/default/data/run-logs paperclip/instances/default/logs paperclip/instances/default/workspaces || die "tar failed"
-echo "WP16_WSDIRS $(cd /paperclip/instances/default/workspaces && find . -mindepth 1 -type d | LC_ALL=C sort | tr '\n' ' ')"
+(cd /paperclip/instances/default/workspaces && find . -mindepth 1 -type d > /tmp/wp16-wsd) || die "workspace scan failed"
+LC_ALL=C sort /tmp/wp16-wsd > /tmp/wp16-wsds || die "workspace sort failed"
+echo "WP16_WSDIRS $(tr '\n' ' ' < /tmp/wp16-wsds)"
 h="$(sha256sum /tmp/wp16.tgz)" || die "archive hash failed"
 echo "WP16_INFO archive_sha256 ${h%% *}"
 echo "WP16_B64_BEGIN"; base64 /tmp/wp16.tgz || die "base64 failed"; echo "WP16_B64_END"
@@ -285,6 +290,11 @@ step_recheck() { # right before attach: nothing new in the original since the sn
 step_attach() { # new image + volume + backups off, heartbeats still paused (= restore-only mode)
   [ -s "$OUT/paperclip-runlogs.tgz.sha256" ] || die "no verified snapshot"
   railway variable set -s "$SVC" --skip-deploys PAPERCLIP_DB_BACKUP_ENABLED=false > /dev/null
+  # Heartbeat runs come from Paperclip's own timer (every 2 h at even ET hours,
+  # ~:35). The new container must run none until probe-check has passed;
+  # `resume` re-enables it. The OLD container keeps its timer: run snapshot,
+  # recheck and the image deploy inside one gap between batches.
+  railway variable set -s "$SVC" --skip-deploys HEARTBEAT_SCHEDULER_ENABLED=false > /dev/null
   # New image FIRST: the old USER node image must never boot on a root-owned mount.
   confirm "Deploy the WP-16 image commit to $SVC (merge to its deploy branch), with NO volume yet. n8n heartbeats stay paused. Wait until the deployment is Active."
   railway volume -s "$SVC" add -m /paperclip --json > "$OUT/volume-add.json"
@@ -344,7 +354,9 @@ rm -rf /tmp/wp16-x && mkdir /tmp/wp16-x && tar -C /tmp/wp16-x -xzf /tmp/wp16.tgz
 cp -a /tmp/wp16-x/paperclip/instances/default/data/run-logs/. "$I/data/run-logs/" || die "copy run-logs failed"
 # Old server logs go beside the new server's live log, never over it.
 mkdir -p "$I/workspaces" && cp -a /tmp/wp16-x/paperclip/instances/default/workspaces/. "$I/workspaces/" || die "copy workspaces failed"
-echo "WP16_WSDIRS $(cd "$I/workspaces" && find . -mindepth 1 -type d | LC_ALL=C sort | tr '\n' ' ')"
+(cd "$I/workspaces" && find . -mindepth 1 -type d > /tmp/wp16-wsd) || die "workspace scan failed"
+LC_ALL=C sort /tmp/wp16-wsd > /tmp/wp16-wsds || die "workspace sort failed"
+echo "WP16_WSDIRS $(tr '\n' ' ' < /tmp/wp16-wsds)"
 mkdir -p "$I/logs/pre-wp16" && cp -a /tmp/wp16-x/paperclip/instances/default/logs/. "$I/logs/pre-wp16/" || die "copy logs failed"
 chown -R -h node:node /paperclip || die "chown failed"
 find "$I/data/storage" -type f > /tmp/wp16-st || die "find failed"
@@ -396,7 +408,14 @@ EOF
   diff "$OUT/inventory-before.txt" "$OUT/inventory-after.txt" > "$OUT/persist.diff" || die "files differ after redeploy (see persist.diff)"
   step_verify_runtime
   say "PAPERCLIP_STATE_PERSISTS"
-  say "Owner: re-activate exactly the n8n workflows deactivated in the quiesce step."
+  say "Next: resume (re-enables the heartbeat scheduler)."
+}
+
+step_resume() { # after PAPERCLIP_STATE_PERSISTS; HEARTBEAT_SCHEDULER_ENABLED was unset before attach
+  railway variable delete -s "$SVC" HEARTBEAT_SCHEDULER_ENABLED > /dev/null
+  confirm "Wait until the redeploy triggered by the variable delete is Active."
+  step_verify_runtime
+  say "Heartbeat scheduler re-enabled (overdue agents run at boot)."
 }
 
 step_rollback() {
@@ -422,6 +441,7 @@ case "${1:-help}" in
   restore) step_restore ;;
   probe-plant) step_probe_plant ;;
   probe-check) step_probe_check ;;
+  resume) step_resume ;;
   rollback) step_rollback ;;
   *) say "order: preflight record quiesce snapshot recheck attach restore probe-plant probe-check (rollback on any failure)" ;;
 esac

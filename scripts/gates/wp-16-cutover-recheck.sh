@@ -24,11 +24,11 @@ cat > "$work/bin/railway" <<'EOF'
 c="${@: -1}"
 [ "${#c}" -le 8192 ] || exit 0
 c="${c//\/tmp\/wp16-step/$WORK/wp16-step}"
-c="${c//sh $WORK\/wp16-step.sh/sh $WORK/run-step}"
+c="${c//sh $WORK\/wp16-step-/sh $WORK/run-step $WORK/wp16-step-}"
 sh -c "$c"
 EOF
 cat > "$work/run-step" <<'EOF'
-sed "s#^cd /app\$#cd $WORK/app#" "$WORK/wp16-step.sh" > "$WORK/step.sh"
+sed "s#^cd /app\$#cd $WORK/app#" "$1" > "$WORK/step.sh"
 PATH="$WORK/sbin:$PATH" sh "$WORK/step.sh"
 EOF
 
