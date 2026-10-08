@@ -290,7 +290,7 @@ EOF
   got="$(sha256sum "$OUT/paperclip-runlogs.tgz" | cut -d' ' -f1)"
   [ "$got" = "$want" ] || die "archive sha256 mismatch: remote $want local $got"
   printf '%s  paperclip-runlogs.tgz\n' "$got" > "$OUT/paperclip-runlogs.tgz.sha256"
-  tar -tzf "$OUT/paperclip-runlogs.tgz" | LC_ALL=C sort > "$OUT/archive-list.txt"
+  tar --force-local -tzf "$OUT/paperclip-runlogs.tgz" | LC_ALL=C sort > "$OUT/archive-list.txt"
   cut -c67- "$OUT/inventory-before.txt" | LC_ALL=C sort | comm -23 - "$OUT/archive-list.txt" > "$OUT/missing-from-archive.txt"
   [ ! -s "$OUT/missing-from-archive.txt" ] || die "archive lacks inventoried files"
   say "snapshot ok: $(wc -l < "$OUT/inventory-before.txt") files, sha256 $got; $(cat "$OUT/runlog-counts-before.txt")"
