@@ -16,13 +16,20 @@ work="$(mktemp -d)" || exit 2
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin" "$work/sbin" "$work/app" "$work/out"
 
+# Models the measured transport: a command line over 8192 chars is silently
+# dropped (nothing runs, nothing returned). Otherwise the command runs under
+# sh with /tmp/wp16-step* mapped into $WORK and the step script run there.
 cat > "$work/bin/railway" <<'EOF'
 #!/bin/bash
-for a in "$@"; do case "$a" in "echo "*)
-  b=${a#echo }; b=${b%% |*}
-  printf '%s' "$b" | base64 -d | sed "s#^cd /app\$#cd $WORK/app#" > "$WORK/step.sh"
-  PATH="$WORK/sbin:$PATH" sh "$WORK/step.sh"; exit 0 ;; esac; done
-exit 1
+c="${@: -1}"
+[ "${#c}" -le 8192 ] || exit 0
+c="${c//\/tmp\/wp16-step/$WORK/wp16-step}"
+c="${c//sh $WORK\/wp16-step.sh/sh $WORK/run-step}"
+sh -c "$c"
+EOF
+cat > "$work/run-step" <<'EOF'
+sed "s#^cd /app\$#cd $WORK/app#" "$WORK/wp16-step.sh" > "$WORK/step.sh"
+PATH="$WORK/sbin:$PATH" sh "$WORK/step.sh"
 EOF
 
 # Postgres text->timestamptz for the inputs that matter here: a full ISO UTC
@@ -72,5 +79,12 @@ echo "same-day earlier run: recheck $got (want PASS)"
 got="$(RUNS="2026-10-07T08:00:00.000000Z 2026-10-07T12:40:00.000000Z" recheck)"
 echo "run created after snapshot: recheck $got (want FAIL)"
 [ "$got" = FAIL ] || fails=$((fails + 1))
+
+# A step script whose base64 exceeds one command line must still run intact.
+got="$( ( source "$script" help > /dev/null
+  { printf '# %s\n' "$(head -c 9000 /dev/zero | tr '\0' p)"; echo 'echo "WP16_INFO long_ok"'; } \
+    | remote long "$OUT/long.txt" > /dev/null 2>&1 && grep -qx 'WP16_INFO long_ok' "$OUT/long.txt" ) && echo PASS || echo FAIL)"
+echo "step script over 8 KiB: $got (want PASS)"
+[ "$got" = PASS ] || fails=$((fails + 1))
 
 if [ "$fails" = 0 ]; then echo "WP16_RECHECK_OK"; else echo "WP16_RECHECK_FAIL ($fails)"; exit 1; fi

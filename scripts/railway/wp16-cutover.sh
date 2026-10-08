@@ -30,15 +30,23 @@ confirm() {
 }
 
 # remote <step> <outfile>, remote POSIX sh script on stdin.
-# The script travels as one base64 argument (no quoting across the ssh hop, no
-# stdin forwarding). Windows caps a command line near 32 KiB, so the argument
-# is size-checked. A step counts as done only if its last output line is
+# The script travels as base64 arguments (no quoting across the ssh hop, no
+# stdin forwarding). railway ssh silently drops a command line over about
+# 8 KiB (measured 2026-10-08: 8101 chars arrive, 8301 do not), so the base64
+# goes up in 6000-char pieces and its sha256 is checked before it runs.
+# A step counts as done only if its last output line is
 # "WP16_REMOTE_OK <step>". CRs from a pty are stripped.
 remote() {
-  local step="$1" out="$2" b64
+  local step="$1" out="$2" b64 h i=0
   b64="$( { printf 'set -eu\ndie() { echo "WP16_ERR $*"; exit 1; }\n'; cat; printf '\necho "WP16_REMOTE_OK %s"\n' "$step"; } | base64 -w0)"
-  [ "${#b64}" -lt 30000 ] || die "remote script for $step too long for one command line (${#b64})"
-  if ! railway ssh -s "$SVC" -- "echo $b64 | base64 -d > /tmp/wp16-step.sh && sh /tmp/wp16-step.sh" > "$out.raw" 2> "$out.err"; then
+  h="$(printf '%s' "$b64" | sha256sum | cut -d' ' -f1)"
+  railway ssh -s "$SVC" -- "rm -f /tmp/wp16-step.b64" > /dev/null 2> "$out.err" || die "railway ssh failed in step $step (stderr in $out.err)"
+  while [ "$i" -lt "${#b64}" ]; do
+    railway ssh -s "$SVC" -- "printf %s ${b64:i:6000} >> /tmp/wp16-step.b64" > /dev/null 2> "$out.err" \
+      || die "upload failed in step $step (stderr in $out.err)"
+    i=$((i + 6000))
+  done
+  if ! railway ssh -s "$SVC" -- "echo '$h  /tmp/wp16-step.b64' | sha256sum -c --status || { echo 'WP16_ERR uploaded step script hash mismatch'; exit 1; }; base64 -d /tmp/wp16-step.b64 > /tmp/wp16-step.sh && sh /tmp/wp16-step.sh" > "$out.raw" 2> "$out.err"; then
     tr -d '\r' < "$out.raw" | grep -E '^WP16_(ERR|WARN)' >&2 || true
     die "railway ssh failed in step $step (stderr in $out.err)"
   fi
