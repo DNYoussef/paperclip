@@ -41,8 +41,10 @@ ENV NODE_ENV=production \
 
 EXPOSE 3100
 
+# The health probe runs as root (no USER). -q must be the first option: it
+# stops curl reading $HOME/.curlrc, and HOME=/paperclip is agent-writable.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD curl -sf http://localhost:3100/api/health || exit 1
+  CMD curl -q -sf http://localhost:3100/api/health || exit 1
 
 # No USER here: the entrypoint starts as root to chown the /paperclip volume,
 # then drops to node via setpriv (util-linux, essential in Debian trixie).

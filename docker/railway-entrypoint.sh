@@ -1,20 +1,29 @@
 #!/bin/sh
 # Railway entrypoint: runs as root only long enough to make the state volume
-# writable by node, then drops to node for good. Any failure exits non-zero;
-# the CMD is never run as root.
+# owned and writable by node, then drops to node for good. Any failure exits
+# non-zero; the CMD is never run as root.
 set -eu
 
-state_dir="${PAPERCLIP_HOME:-/paperclip}"
-node_uid="$(id -u node)"
-[ "$node_uid" != "0" ] || { echo "railway-entrypoint: node uid is 0, refusing" >&2; exit 1; }
+die() { echo "railway-entrypoint: $*" >&2; exit 1; }
 
-mkdir -p "$state_dir"
-# A fresh Railway volume mounts root-owned. Re-own the whole tree only when the
-# top level is wrong, so a large volume is not walked on every boot.
-# ponytail: files added as root under an already node-owned dir (railway ssh
-# copy-ins) are not caught here; chown -R by hand after any root copy-in.
-if [ "$(stat -c %u "$state_dir")" != "$node_uid" ]; then
-  chown -R node:node "$state_dir"
-fi
+state_dir="${PAPERCLIP_HOME:-/paperclip}"
+instance_dir="$state_dir/instances/${PAPERCLIP_INSTANCE_ID:-default}"
+
+# Plain assignment: set -e exits if id fails (no `|| ...`, no `local`).
+node_uid="$(id -u node)"
+[ -n "$node_uid" ] || die "could not resolve uid of node"
+[ "$node_uid" != "0" ] || die "node uid is 0, refusing"
+
+mkdir -p "$instance_dir"
+# -R with GNU's default -P: never follow symlinks while walking; -h: re-own the
+# link itself, not its target. Exits non-zero if any entry fails.
+# ponytail: walks the whole volume on every boot. Fine at current size; if boot
+# time matters, switch to a marker file plus `find -not -user node`.
+chown -R -h node:node "$state_dir" || die "chown of $state_dir failed"
+
+for dir in "$state_dir" "$instance_dir"; do
+  setpriv --reuid=node --regid=node --init-groups -- test -w "$dir" \
+    || die "$dir is not writable as node"
+done
 
 exec setpriv --reuid=node --regid=node --init-groups -- "$@"
