@@ -4,9 +4,11 @@ import { fileURLToPath } from "node:url";
 import { hashPassword } from "better-auth/crypto";
 import { eq, sql } from "drizzle-orm";
 import { authAccounts, authSessions, authUsers, createDb, instanceUserRoles, type Db } from "@paperclipai/db";
+import { claimExclusiveServingLease } from "./serving-lease.js";
 
-// Operator-only instance-admin recovery. Runs with database access (Railway
-// shell), never over HTTP, and never opens public sign-up. For an existing
+// Operator-only instance-admin recovery. Runs with database access, never over
+// HTTP, never opens public sign-up, and refuses while any Paperclip server
+// holds the serving lease (serving-lease.ts). For an existing
 // user it deletes every credential (password and linked providers such as
 // Google) and every session before setting a fresh password, so whoever held
 // the account before (for example an attacker who registered the email while
@@ -20,6 +22,9 @@ export async function recoverInstanceAdmin(db: Db, rawEmail: string) {
   const now = new Date();
 
   return db.transaction(async (tx) => {
+    // No server may be serving: a login already past password verification
+    // would otherwise write its session after this commit.
+    await claimExclusiveServingLease(tx);
     const users = await tx.select().from(authUsers).where(eq(sql`lower(${authUsers.email})`, email));
     if (users.length > 1) throw new Error(`${users.length} users share ${email}; resolve by hand`);
     let userId = users[0]?.id;

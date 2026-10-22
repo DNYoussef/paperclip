@@ -436,6 +436,10 @@ export async function startServer(): Promise<StartedServer> {
         "authenticated mode requires BETTER_AUTH_SECRET (or PAPERCLIP_AGENT_JWT_SECRET) to be set",
       );
     }
+    // Held for the process lifetime; operator recovery refuses while it is
+    // held, and boot waits here while a recovery is committing.
+    const { acquireServingLease } = await import("./auth/serving-lease.js");
+    await acquireServingLease(db as any);
     const derivedTrustedOrigins = deriveAuthTrustedOrigins(config);
     const envTrustedOrigins = (process.env.BETTER_AUTH_TRUSTED_ORIGINS ?? "")
       .split(",")

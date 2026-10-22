@@ -15,12 +15,23 @@ Existing users sign in as before. A first Google sign-in links to an existing
 user with the same verified email, so a forgotten password is recovered by
 signing in with Google.
 
-Owner recovery (full lockout, or a new instance admin) never reopens sign-up.
-It runs as the operator in the service shell, with the database URL the
-service already has:
+Owner recovery (full lockout, or a new instance admin) never reopens sign-up,
+and it only runs while no Paperclip server is serving. Every server holds a
+shared Postgres advisory lock (the serving lease, `server/src/auth/serving-lease.ts`)
+for its whole life; the recovery tool takes the exclusive lock in its
+transaction and refuses with "holds the serving lease" otherwise. That is what
+stops a login that already passed password verification from writing a session
+after recovery. A server that boots while recovery is committing waits for it.
 
-1. Open a shell in the running service (`railway ssh --service <paperclip>`).
-2. From `/app`, run
+1. Stop every paperclip server process (all replicas) while keeping a shell
+   with the service's `DATABASE_URL`. The database has no public endpoint, so
+   use the service itself: set the paperclip service's Custom Start Command to
+   `sleep infinity` and deploy. Wait until the previous deployment is gone
+   (the tool will refuse while it still serves). If a healthcheck path is
+   configured, this deployment never turns healthy; remove the healthcheck for
+   the window or use another way to stop the server. (Not yet exercised on
+   Railway.)
+2. `railway ssh --service <paperclip>`, then from `/app`:
    `node --import ./server/node_modules/tsx/dist/loader.mjs server/src/auth/recover-admin.ts <email>`
    For an existing user it deletes every credential (password and linked
    Google) and every session, sets a fresh random password, and grants
@@ -28,10 +39,8 @@ service already has:
    unknown email it creates the user with that password and grants instance
    admin. It prints the one-time password once. Instance admins see and
    manage every company.
-3. Restart the paperclip service, so live-event streams opened with the
-   deleted sessions close.
-4. Sign in with the email and the printed password. To rotate it, run the
-   tool again.
+3. Clear the Custom Start Command and deploy. Sign in with the email and the
+   printed password. To rotate it, repeat from step 1.
 
 Do not reopen sign-up to recover. `PAPERCLIP_AUTH_DISABLE_SIGN_UP=false` opens
 registration to anyone who can reach the server, for any email: an attacker

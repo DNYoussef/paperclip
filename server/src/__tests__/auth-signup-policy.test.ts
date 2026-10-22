@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import request from "supertest";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { authAccounts, authUsers, instanceUserRoles } from "@paperclipai/db";
+import { authAccounts, authSessions, authUsers, instanceUserRoles } from "@paperclipai/db";
 import { createApp } from "../app.js";
 import {
   createBetterAuthHandler,
@@ -452,5 +452,127 @@ describe("owner recovery never opens sign-up", { timeout: 120_000 }, () => {
     const [user] = await testDb.db.select().from(authUsers).where(eq(authUsers.email, email));
     const roles = await testDb.db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, user!.id));
     expect(roles.map((r) => r.role)).toContain("instance_admin");
+  });
+});
+
+// Same command, without throwing, so a refusal can be asserted.
+function runRecoverAdminAsync(email: string) {
+  return new Promise<{ code: number; out: string; password?: string }>((resolve) => {
+    execFile(
+      process.execPath,
+      ["--import", TSX_LOADER, RECOVER_SCRIPT, email],
+      { env: { ...process.env, DATABASE_URL: testDb.url }, encoding: "utf8" },
+      (err, stdout, stderr) => {
+        const out = `${stdout}${stderr}`;
+        resolve({
+          code: err ? ((err as { code?: number }).code ?? 1) : 0,
+          out,
+          password: /One-time password: (\S+)/.exec(out)?.[1],
+        });
+      },
+    );
+  });
+}
+
+// A real Better Auth instance whose session INSERT waits on a gate: the
+// password has been verified, the session row is not yet written.
+function pausedSessionInsert(config: Config) {
+  let resume!: () => void;
+  const gate = new Promise<void>((r) => (resume = r));
+  let reached!: () => void;
+  const paused = new Promise<void>((r) => (reached = r));
+  const real = testDb.db as any;
+  const db = new Proxy(real, {
+    get(target, prop) {
+      if (prop === "insert") {
+        return (table: unknown) => {
+          if (table !== authSessions) return target.insert(table);
+          return {
+            values: (values: unknown) => ({
+              returning: async () => {
+                reached();
+                await gate;
+                return target.insert(table).values(values).returning();
+              },
+            }),
+          };
+        };
+      }
+      const value = target[prop];
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const auth = createBetterAuthInstance(db, { ...config, authBaseUrlMode: "explicit", authPublicBaseUrl: ORIGIN });
+  return { auth, paused, resume };
+}
+
+describe("owner recovery is safe against in-flight authentication", { timeout: 120_000 }, () => {
+  it("an old-password login already past verification holds no usable session once recovery completes", async () => {
+    const email = unique("inflight");
+    const attackerPassword = "FAKE_TEST_ATTACKER_PASSWORD_456";
+    const planted = await call(openAuth, "POST", "/sign-up/email", {
+      body: { name: "attacker", email, password: attackerPassword },
+    });
+    expect(planted.status).toBe(200);
+
+    // A running server holds the serving lease (index.ts does this at boot).
+    const leaseModule = await import("../auth/serving-lease.js").catch(() => null);
+    const lease = await leaseModule?.acquireServingLease(testDb.db, { onLost: () => {} });
+
+    // The attacker's login is past password verification, session not written.
+    const server = pausedSessionInsert(productionConfig);
+    const login = call(server.auth, "POST", "/sign-in/email", { body: { email, password: attackerPassword } });
+    await server.paused;
+
+    // The operator tries to recover while that server is serving.
+    const during = await runRecoverAdminAsync(email);
+    server.resume();
+    const resumed = await login;
+
+    // Documented order: stop every server, then recover.
+    await lease?.release();
+    let newPassword = during.password;
+    if (during.code !== 0) {
+      expect(during.out).toMatch(/serving lease/);
+      expect(during.password).toBeUndefined();
+      const after = await runRecoverAdminAsync(email);
+      expect(after.code, after.out).toBe(0);
+      newPassword = after.password;
+    }
+
+    // Whatever the in-flight login produced is not a usable session.
+    const inflightCookie = cookiesOf(resumed);
+    expect(await sessionOf(inflightCookie)).toBeNull();
+    const old = await call(closedAuth, "POST", "/sign-in/email", { body: { email, password: attackerPassword } });
+    expect(old.status).toBeGreaterThanOrEqual(400);
+    const owner = await call(closedAuth, "POST", "/sign-in/email", { body: { email, password: newPassword } });
+    expect(owner.status).toBe(200);
+    expect(await sessionOf(cookiesOf(owner))).not.toBeNull();
+  });
+
+  it("a server starting while recovery holds the exclusive lease waits until recovery commits", async () => {
+    const { acquireServingLease, claimExclusiveServingLease } = await import("../auth/serving-lease.js");
+    let commit!: () => void;
+    const held = new Promise<void>((r) => (commit = r));
+    let claimed!: () => void;
+    const isClaimed = new Promise<void>((r) => (claimed = r));
+    const recovery = testDb.db.transaction(async (tx) => {
+      await claimExclusiveServingLease(tx);
+      claimed();
+      await held;
+    });
+    await isClaimed;
+    let started = false;
+    const starting = acquireServingLease(testDb.db, { onLost: () => {} }).then((l) => {
+      started = true;
+      return l;
+    });
+    await new Promise((r) => setTimeout(r, 500));
+    expect(started).toBe(false);
+    commit();
+    await recovery;
+    const lease = await starting;
+    expect(started).toBe(true);
+    await lease.release();
   });
 });
