@@ -197,8 +197,6 @@ describe("sign-up policy applies to every provider", { timeout: 60_000 }, () => 
     expect(productionConfig.authDisableSignUp).toBe(true);
     expect(recoveryConfig.authDisableSignUp).toBe(false);
     expect(configFromEnv(dockerfileEnv()).authDisableSignUp).toBe(true);
-    const railwayJson = JSON.parse(readFileSync(new URL("../../../railway.json", import.meta.url), "utf8"));
-    expect(railwayJson.build).toEqual({ builder: "DOCKERFILE", dockerfilePath: "Dockerfile.railway" });
   });
 
   it("on Railway sign-up is closed whichever Dockerfile built the image", () => {
@@ -210,6 +208,27 @@ describe("sign-up policy applies to every provider", { timeout: 60_000 }, () => 
     // Control: off Railway, without the image line, the upstream default (open) holds.
     expect(configFromEnv(dockerfileEnv("Dockerfile")).authDisableSignUp).toBe(false);
     expect(configFromEnv(withoutLine).authDisableSignUp).toBe(false);
+  });
+
+  it("root Dockerfile settings on Railway: email and Google sign-up are refused end to end", async () => {
+    const rootOnRailway = makeAuth(configFromEnv(dockerfileEnv("Dockerfile"), ON_RAILWAY));
+
+    const byEmail = unique("root-email");
+    const email = await call(rootOnRailway, "POST", "/sign-up/email", {
+      body: { name: "x", email: byEmail, password: "FAKE_TEST_PASSWORD_123" },
+    });
+    expect(email.status).toBeGreaterThanOrEqual(400);
+    expect(await usersWithEmail(byEmail)).toBe(0);
+
+    const byRedirect = unique("root-redirect");
+    const redirect = await googleRedirectSignIn(rootOnRailway, byRedirect, `sub-${randomUUID()}`);
+    expect(redirect.headers.get("location")).toMatch(/error=/);
+    expect(await usersWithEmail(byRedirect)).toBe(0);
+
+    const byIdToken = unique("root-idtoken");
+    const idToken = await googleIdTokenSignIn(rootOnRailway, byIdToken, `sub-${randomUUID()}`);
+    expect(idToken.status).toBeGreaterThanOrEqual(400);
+    expect(await usersWithEmail(byIdToken)).toBe(0);
   });
 
   it("PAPERCLIP_AUTH_DISABLE_SIGN_UP accepts only true/false; anything else stops startup", () => {
