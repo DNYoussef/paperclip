@@ -4,11 +4,12 @@ import { fileURLToPath } from "node:url";
 import { hashPassword } from "better-auth/crypto";
 import { eq, sql } from "drizzle-orm";
 import { authAccounts, authSessions, authUsers, createDb, instanceUserRoles, type Db } from "@paperclipai/db";
-import { claimExclusiveServingLease } from "./serving-lease.js";
+import { beginCredentialRecovery, endCredentialRecovery } from "./credential-epoch.js";
 
 // Operator-only instance-admin recovery. Runs with database access, never over
-// HTTP, never opens public sign-up, and refuses while any Paperclip server
-// holds the serving lease (serving-lease.ts). For an existing
+// HTTP, never opens public sign-up, and is safe while servers keep serving:
+// the credential epoch (credential-epoch.ts) makes any login, password
+// change or provider link that was in flight lose what it writes. For an existing
 // user it deletes every credential (password and linked providers such as
 // Google) and every session before setting a fresh password, so whoever held
 // the account before (for example an attacker who registered the email while
@@ -21,41 +22,47 @@ export async function recoverInstanceAdmin(db: Db, rawEmail: string) {
   const hash = await hashPassword(password);
   const now = new Date();
 
-  return db.transaction(async (tx) => {
-    // No server may be serving: a login already past password verification
-    // would otherwise write its session after this commit.
-    await claimExclusiveServingLease(tx);
-    const users = await tx.select().from(authUsers).where(eq(sql`lower(${authUsers.email})`, email));
-    if (users.length > 1) throw new Error(`${users.length} users share ${email}; resolve by hand`);
-    let userId = users[0]?.id;
-    let removedAccounts = 0;
-    let removedSessions = 0;
-    if (userId) {
-      removedAccounts = (await tx.delete(authAccounts).where(eq(authAccounts.userId, userId)).returning()).length;
-      removedSessions = (await tx.delete(authSessions).where(eq(authSessions.userId, userId)).returning()).length;
-    } else {
-      userId = randomUUID();
-      await tx.insert(authUsers).values({
-        id: userId,
-        name: email.split("@")[0]!,
-        email,
-        emailVerified: false,
+  const odd = await beginCredentialRecovery(db);
+  try {
+    return await db.transaction(async (tx) => {
+      const users = await tx.select().from(authUsers).where(eq(sql`lower(${authUsers.email})`, email));
+      if (users.length > 1) throw new Error(`${users.length} users share ${email}; resolve by hand`);
+      let userId = users[0]?.id;
+      let removedAccounts = 0;
+      let removedSessions = 0;
+      if (userId) {
+        removedAccounts = (await tx.delete(authAccounts).where(eq(authAccounts.userId, userId)).returning()).length;
+        removedSessions = (await tx.delete(authSessions).where(eq(authSessions.userId, userId)).returning()).length;
+      } else {
+        userId = randomUUID();
+        await tx.insert(authUsers).values({
+          id: userId,
+          name: email.split("@")[0]!,
+          email,
+          emailVerified: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+      await tx.insert(authAccounts).values({
+        id: randomUUID(),
+        accountId: userId,
+        providerId: "credential",
+        userId,
+        password: hash,
         createdAt: now,
         updatedAt: now,
       });
-    }
-    await tx.insert(authAccounts).values({
-      id: randomUUID(),
-      accountId: userId,
-      providerId: "credential",
-      userId,
-      password: hash,
-      createdAt: now,
-      updatedAt: now,
+      await tx.insert(instanceUserRoles).values({ userId, role: "instance_admin" }).onConflictDoNothing();
+      return { userId, email, password, created: users.length === 0, removedAccounts, removedSessions };
     });
-    await tx.insert(instanceUserRoles).values({ userId, role: "instance_admin" }).onConflictDoNothing();
-    return { userId, email, password, created: users.length === 0, removedAccounts, removedSessions };
-  });
+  } finally {
+    // Also after a rolled-back transaction (nothing changed). If the process
+    // dies before this, logins stay refused until the tool runs again.
+    if (!(await endCredentialRecovery(db, odd))) {
+      console.error("another recovery moved the credential epoch; logins stay refused until it finishes");
+    }
+  }
 }
 
 // node --import ./server/node_modules/tsx/dist/loader.mjs server/src/auth/recover-admin.ts <email>

@@ -13,6 +13,12 @@ import {
   authVerifications,
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
+import {
+  assertCredentialWriteAllowed,
+  pendingPassword,
+  rememberPendingPassword,
+  withEntryEpoch,
+} from "./credential-epoch.js";
 import { closeLiveEventsConnections } from "../services/live-events.js";
 
 export type BetterAuthSessionUser = {
@@ -161,10 +167,54 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins?
           },
         },
       },
+      // Credential epoch (credential-epoch.ts): a session or account write by
+      // a request that entered before or during an operator recovery is
+      // refused, or deleted again if it already landed.
       session: {
+        create: {
+          before: async () => {
+            await assertCredentialWriteAllowed(db);
+          },
+          after: async (session: { id: string }) => {
+            await assertCredentialWriteAllowed(db).catch(async (err) => {
+              await db.delete(authSessions).where(eq(authSessions.id, session.id));
+              throw err;
+            });
+          },
+        },
         delete: {
           after: async (session: { id: string }) => {
             closeLiveEventsConnections({ sessionId: session.id }, "session revoked");
+          },
+        },
+      },
+      account: {
+        create: {
+          before: async () => {
+            await assertCredentialWriteAllowed(db);
+          },
+          after: async (account: { id: string }) => {
+            await assertCredentialWriteAllowed(db).catch(async (err) => {
+              await db.delete(authAccounts).where(eq(authAccounts.id, account.id));
+              throw err;
+            });
+          },
+        },
+        update: {
+          before: async (data: { password?: unknown }) => {
+            await assertCredentialWriteAllowed(db);
+            rememberPendingPassword(data.password);
+          },
+          // update returns the row; updateMany (password change) a count, so
+          // a late password is found by the hash it wrote.
+          after: async (result: unknown) => {
+            await assertCredentialWriteAllowed(db).catch(async (err) => {
+              const id = (result as { id?: unknown } | null)?.id;
+              const hash = pendingPassword();
+              if (typeof id === "string") await db.delete(authAccounts).where(eq(authAccounts.id, id));
+              if (hash) await db.delete(authAccounts).where(eq(authAccounts.password, hash));
+              throw err;
+            });
           },
         },
       },
@@ -175,7 +225,9 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins?
     delete (authConfig as { baseURL?: string }).baseURL;
   }
 
-  return betterAuth(authConfig);
+  const auth = betterAuth(authConfig);
+  auth.handler = withEntryEpoch(db, auth.handler);
+  return auth;
 }
 
 export function createBetterAuthHandler(auth: BetterAuthInstance): RequestHandler {
