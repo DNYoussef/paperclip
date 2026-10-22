@@ -15,24 +15,32 @@ Existing users sign in as before. A first Google sign-in links to an existing
 user with the same verified email, so a forgotten password is recovered by
 signing in with Google.
 
-Full lockout, or adding a person. The service has no config.json (measured
-2026-10-07); the CLI reads `PAPERCLIP_DEPLOYMENT_MODE` and `DATABASE_URL` from
-the service environment.
+Owner recovery (full lockout, or a new instance admin) never reopens sign-up.
+It runs as the operator in the service shell, with the database URL the
+service already has:
 
-1. In Railway, set the paperclip variable `PAPERCLIP_AUTH_DISABLE_SIGN_UP=false`
-   and deploy.
-2. Open a shell in the running service (`railway ssh --service <paperclip>`)
-   and, from `/app`, create a one-time admin invite:
-   `node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts auth bootstrap-ceo --force --base-url <URL you open Paperclip at>`
-   `--force` is needed because an instance admin already exists. The previous
-   unaccepted bootstrap invite is revoked.
-3. Open the printed `/invite/<token>` URL, create the account, accept the
-   invite. Accepting makes the account an instance admin, which sees and
-   manages every company (no company membership is needed).
-4. Delete the variable (do not set it to anything else) and deploy. Check the
-   boot log shows `authDisableSignUp: true`. Then sign in with the new account.
+1. Open a shell in the running service (`railway ssh --service <paperclip>`).
+2. From `/app`, run
+   `node --import ./server/node_modules/tsx/dist/loader.mjs server/src/auth/recover-admin.ts <email>`
+   For an existing user it deletes every credential (password and linked
+   Google) and every session, sets a fresh random password, and grants
+   instance admin; the user row, its history and memberships stay. For an
+   unknown email it creates the user with that password and grants instance
+   admin. It prints the one-time password once. Instance admins see and
+   manage every company.
+3. Restart the paperclip service, so live-event streams opened with the
+   deleted sessions close.
+4. Sign in with the email and the printed password. To rotate it, run the
+   tool again.
 
-Invited people cannot register while sign-up is closed; use the same window.
+Do not reopen sign-up to recover. `PAPERCLIP_AUTH_DISABLE_SIGN_UP=false` opens
+registration to anyone who can reach the server, for any email: an attacker
+can register an admin's address with their own password, and that admin's
+later Google sign-in links to the attacker's account. If sign-up was ever
+open, run the recovery tool for every admin email afterwards, and review the
+`user` table for accounts nobody expected. Invited people cannot register
+while sign-up is closed; create them with the tool or reopen deliberately for
+the shortest possible window.
 
 ## wp16-cutover.sh: move run logs onto a Railway volume at /paperclip
 

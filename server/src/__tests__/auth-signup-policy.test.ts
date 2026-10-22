@@ -5,10 +5,16 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import request from "supertest";
-import { authUsers, instanceUserRoles } from "@paperclipai/db";
-import { bootstrapCeoInvite } from "../../../cli/src/commands/auth-bootstrap-ceo.js";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { authAccounts, authUsers, instanceUserRoles } from "@paperclipai/db";
 import { createApp } from "../app.js";
-import { createBetterAuthHandler, createBetterAuthInstance, resolveBetterAuthSession } from "../auth/better-auth.js";
+import {
+  createBetterAuthHandler,
+  createBetterAuthInstance,
+  resolveBetterAuthSession,
+  resolveBetterAuthSessionFromHeaders,
+} from "../auth/better-auth.js";
 import type { Config } from "../config.js";
 import { seedWorld } from "./helpers/real-app.js";
 import { startTestDb, type TestDb } from "./helpers/test-db.js";
@@ -204,6 +210,9 @@ describe("sign-up policy applies to every provider", { timeout: 60_000 }, () => 
     expect(dockerfileEnv("Dockerfile").PAPERCLIP_AUTH_DISABLE_SIGN_UP).toBeUndefined();
     expect(configFromEnv(dockerfileEnv("Dockerfile"), ON_RAILWAY).authDisableSignUp).toBe(true);
     expect(configFromEnv(dockerfileEnv("Dockerfile"), { RAILWAY_ENVIRONMENT_NAME: "production" }).authDisableSignUp).toBe(true);
+    // A marker that is present but empty still means Railway.
+    expect(configFromEnv(dockerfileEnv("Dockerfile"), { RAILWAY_ENVIRONMENT_ID: "" }).authDisableSignUp).toBe(true);
+    expect(configFromEnv(dockerfileEnv("Dockerfile"), { RAILWAY_ENVIRONMENT_NAME: "" }).authDisableSignUp).toBe(true);
     expect(configFromEnv(withoutLine, ON_RAILWAY).authDisableSignUp).toBe(true);
     // Control: off Railway, without the image line, the upstream default (open) holds.
     expect(configFromEnv(dockerfileEnv("Dockerfile")).authDisableSignUp).toBe(false);
@@ -357,68 +366,91 @@ function sessionCookie(res: request.Response) {
   return ([] as string[]).concat(res.headers["set-cookie"] ?? []).map((c) => c.split(";")[0]).join("; ");
 }
 
-describe("owner recovery on an env-only Railway deployment", { timeout: 120_000 }, () => {
-  it("reopen, bootstrap-ceo without config.json, accept, close again: the new account is instance admin", async () => {
-    // The locked-out owner is world.users.admin, an existing instance admin.
+const RECOVER_SCRIPT = fileURLToPath(new URL("../auth/recover-admin.ts", import.meta.url));
+const TSX_LOADER = new URL("../../node_modules/tsx/dist/loader.mjs", import.meta.url).href;
+
+// The documented operator command, run the way the Railway shell runs it:
+// node with the server's tsx loader, DATABASE_URL from the environment.
+function runRecoverAdmin(email: string) {
+  const out = execFileSync(process.execPath, ["--import", TSX_LOADER, RECOVER_SCRIPT, email], {
+    env: { ...process.env, DATABASE_URL: testDb.url },
+    encoding: "utf8",
+  });
+  const password = /One-time password: (\S+)/.exec(out)?.[1];
+  expect(password, out).toBeTruthy();
+  return password!;
+}
+
+// The server's own session resolver (what the actor middleware uses).
+function sessionOf(cookie: string) {
+  return resolveBetterAuthSessionFromHeaders(closedAuth, new Headers({ cookie }));
+}
+
+async function signIn(app: Awaited<ReturnType<typeof appWith>>, email: string, password: string) {
+  return request(app).post("/api/auth/sign-in/email").set("origin", ORIGIN).send({ email, password });
+}
+
+describe("owner recovery never opens sign-up", { timeout: 120_000 }, () => {
+  it("an attacker who registered the owner's email in an earlier open window keeps nothing after recovery", async () => {
     const world = await seedWorld(testDb.db);
-    const password = "FAKE_TEST_RECOVERY_PASSWORD_123";
-    const email = unique("recovered-owner");
+    const email = unique("owner-target");
+    const ownerSub = `sub-${randomUUID()}`;
+    const open = await appWith(openAuth);
+    const closed = await appWith(closedAuth);
 
-    // 1. Railway variable PAPERCLIP_AUTH_DISABLE_SIGN_UP=false, redeploy.
-    const reopened = await appWith(makeAuth(recoveryConfig));
-
-    // 2. In the service shell: no config.json, env from the image and Railway.
-    const home = mkdtempSync(join(tmpdir(), "paperclip-a5-cli-"));
-    vi.stubEnv("PAPERCLIP_CONFIG", join(home, "config.json"));
-    vi.stubEnv("PAPERCLIP_DEPLOYMENT_MODE", dockerfileEnv().PAPERCLIP_DEPLOYMENT_MODE);
-    vi.stubEnv("DATABASE_URL", testDb.url);
-    let inviteUrl: string | undefined;
-    try {
-      inviteUrl = await bootstrapCeoInvite({ force: true, baseUrl: ORIGIN });
-    } finally {
-      vi.stubEnv("PAPERCLIP_CONFIG", undefined);
-      vi.stubEnv("PAPERCLIP_DEPLOYMENT_MODE", undefined);
-      vi.stubEnv("DATABASE_URL", undefined);
-    }
-    expect(inviteUrl).toMatch(/^http:\/\/localhost:3100\/invite\/pcp_bootstrap_[0-9a-f]+$/);
-    const token = inviteUrl!.split("/invite/")[1];
-
-    // 3. Create the account and accept the invite while sign-up is open.
-    const signUp = await request(reopened)
+    // Earlier open window: the attacker registers the owner's email.
+    const attackerPassword = "FAKE_TEST_ATTACKER_PASSWORD_123";
+    const planted = await request(open)
       .post("/api/auth/sign-up/email")
       .set("origin", ORIGIN)
-      .send({ name: "Recovered owner", email, password });
-    expect(signUp.status).toBe(200);
-    const cookie = sessionCookie(signUp);
-    // Control: a fresh account alone has no access to existing companies.
-    const before = await request(reopened).get("/api/companies").set("origin", ORIGIN).set("cookie", cookie);
-    expect(JSON.stringify(before.body)).not.toContain(world.companyA.id);
+      .send({ name: "attacker", email, password: attackerPassword });
+    expect(planted.status).toBe(200);
+    const attackerCookie = sessionCookie(planted);
+    // The owner's verified Google sign-in links to that same user.
+    const ownerGoogle = await googleRedirectSignIn(closedAuth, email, ownerSub);
+    expect(ownerGoogle.headers.get("location")).not.toMatch(/error=/);
+    // Control: before recovery the attacker's password and session work.
+    expect((await signIn(closed, email, attackerPassword)).status).toBe(200);
+    expect((await sessionOf(attackerCookie))?.user?.email).toBe(email);
 
-    const accept = await request(reopened)
-      .post(`/api/invites/${token}/accept`)
-      .set("origin", ORIGIN)
-      .set("cookie", cookie)
-      .send({ requestType: "human" });
-    expect(accept.status).toBe(202);
-    expect(accept.body.bootstrapAccepted).toBe(true);
-    const roles = await testDb.db
-      .select()
-      .from(instanceUserRoles)
-      .where(eq(instanceUserRoles.userId, accept.body.userId));
+    const newPassword = runRecoverAdmin(email);
+
+    // Sign-up was never reopened: the running policy is still closed.
+    expect(productionConfig.authDisableSignUp).toBe(true);
+    // The attacker's password, session and the old Google link are gone.
+    expect((await signIn(closed, email, attackerPassword)).status).toBeGreaterThanOrEqual(400);
+    expect(await sessionOf(attackerCookie)).toBeNull();
+    const [user] = await testDb.db.select().from(authUsers).where(eq(authUsers.email, email));
+    const accounts = await testDb.db.select().from(authAccounts).where(eq(authAccounts.userId, user!.id));
+    expect(accounts.map((a) => a.providerId)).toEqual(["credential"]);
+    expect(await usersWithEmail(email)).toBe(1);
+
+    // The operator's fresh password works and the account is instance admin.
+    const owner = await signIn(closed, email, newPassword);
+    expect(owner.status).toBe(200);
+    const roles = await testDb.db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, user!.id));
     expect(roles.map((r) => r.role)).toContain("instance_admin");
+    const companies = await request(closed).get("/api/companies").set("origin", ORIGIN).set("cookie", sessionCookie(owner));
+    expect(companies.status).toBe(200);
+    expect(JSON.stringify(companies.body)).toContain(world.companyA.id);
+    expect(JSON.stringify(companies.body)).toContain(world.companyB.id);
+  });
 
-    // 4. Delete the variable, redeploy: closed again, the new admin keeps access.
-    const closed = await appWith(makeAuth(productionConfig));
-    const stranger = await request(closed)
+  it("recovering an email with no account creates a fresh instance admin while sign-up stays closed", async () => {
+    const email = unique("fresh-admin");
+    const closed = await appWith(closedAuth);
+    // Control: that email cannot self-register.
+    const refused = await request(closed)
       .post("/api/auth/sign-up/email")
       .set("origin", ORIGIN)
-      .send({ name: "x", email: unique("after-close"), password });
-    expect(stranger.status).toBeGreaterThanOrEqual(400);
-    const signIn = await request(closed).post("/api/auth/sign-in/email").set("origin", ORIGIN).send({ email, password });
-    expect(signIn.status).toBe(200);
-    const after = await request(closed).get("/api/companies").set("origin", ORIGIN).set("cookie", sessionCookie(signIn));
-    expect(after.status).toBe(200);
-    expect(JSON.stringify(after.body)).toContain(world.companyA.id);
-    expect(JSON.stringify(after.body)).toContain(world.companyB.id);
+      .send({ name: "x", email, password: "FAKE_TEST_PASSWORD_123" });
+    expect(refused.status).toBeGreaterThanOrEqual(400);
+
+    const password = runRecoverAdmin(email);
+    const login = await signIn(closed, email, password);
+    expect(login.status).toBe(200);
+    const [user] = await testDb.db.select().from(authUsers).where(eq(authUsers.email, email));
+    const roles = await testDb.db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, user!.id));
+    expect(roles.map((r) => r.role)).toContain("instance_admin");
   });
 });

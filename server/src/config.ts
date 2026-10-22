@@ -75,7 +75,7 @@ export function resolveAuthDisableSignUp(env: NodeJS.ProcessEnv, fileValue: bool
   if (raw !== undefined) {
     throw new Error(`PAPERCLIP_AUTH_DISABLE_SIGN_UP must be "true" or "false", got ${JSON.stringify(raw)}`);
   }
-  if (env.RAILWAY_ENVIRONMENT_ID || env.RAILWAY_ENVIRONMENT_NAME) return true;
+  if (env.RAILWAY_ENVIRONMENT_ID !== undefined || env.RAILWAY_ENVIRONMENT_NAME !== undefined) return true;
   return fileValue ?? false;
 }
 

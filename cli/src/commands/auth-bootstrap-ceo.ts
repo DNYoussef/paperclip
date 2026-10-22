@@ -56,19 +56,12 @@ export async function bootstrapCeoInvite(opts: {
   const configPath = resolveConfigPath(opts.config);
   loadPaperclipEnvFile(configPath);
   const config = readConfig(configPath);
-  // Same precedence as the server (server/src/config.ts): env beats the file,
-  // so an env-only deployment (Railway: no config.json) can bootstrap too.
-  const envMode = process.env.PAPERCLIP_DEPLOYMENT_MODE;
-  const deploymentMode =
-    envMode === "authenticated" || envMode === "local_trusted" ? envMode : config?.server.deploymentMode;
-  if (!deploymentMode) {
-    p.log.error(
-      `No config found at ${configPath} and PAPERCLIP_DEPLOYMENT_MODE is not set. Run ${pc.cyan("paperclip onboard")} first.`,
-    );
+  if (!config) {
+    p.log.error(`No config found at ${configPath}. Run ${pc.cyan("paperclip onboard")} first.`);
     return;
   }
 
-  if (deploymentMode !== "authenticated") {
+  if (config.server.deploymentMode !== "authenticated") {
     p.log.info("Deployment mode is local_trusted. Bootstrap CEO invite is only required for authenticated mode.");
     return;
   }
@@ -131,7 +124,6 @@ export async function bootstrapCeoInvite(opts: {
     p.log.success("Created bootstrap CEO invite.");
     p.log.message(`Invite URL: ${pc.cyan(inviteUrl)}`);
     p.log.message(`Expires: ${pc.dim(created.expiresAt.toISOString())}`);
-    return inviteUrl;
   } catch (err) {
     p.log.error(`Could not create bootstrap invite: ${err instanceof Error ? err.message : String(err)}`);
     p.log.info("If using embedded-postgres, start the Paperclip server and run this command again.");
