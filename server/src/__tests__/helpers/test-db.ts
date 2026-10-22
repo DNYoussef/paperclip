@@ -10,6 +10,7 @@ import { applyPendingMigrations, createDb, ensurePostgresDatabase, type Db } fro
 // tests that prove them must run that SQL against existing foreign rows.
 export interface TestDb {
   db: Db;
+  url: string;
   stop: () => Promise<void>;
 }
 
@@ -35,6 +36,7 @@ export async function startTestDb(): Promise<TestDb> {
     const db = createDb(url);
     return {
       db,
+      url,
       stop: async () => {
         await (db as any).$client?.end?.().catch(() => {});
         await pg.stop().catch(() => {});

@@ -447,6 +447,7 @@ export async function startServer(): Promise<StartedServer> {
         authBaseUrlMode: config.authBaseUrlMode,
         authPublicBaseUrl: config.authPublicBaseUrl ?? null,
         trustedOrigins: effectiveTrustedOrigins,
+        authDisableSignUp: config.authDisableSignUp,
         trustedOriginsSource: {
           derived: derivedTrustedOrigins.length,
           env: envTrustedOrigins.length,

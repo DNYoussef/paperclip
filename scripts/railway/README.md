@@ -1,5 +1,39 @@
 # Railway scripts
 
+## Sign-up policy and owner recovery
+
+Sign-up is closed on Railway for every provider (email/password and Google).
+`Dockerfile.railway` sets `PAPERCLIP_AUTH_DISABLE_SIGN_UP=true`, and when the
+variable is unset the server still closes sign-up whenever Railway's
+`RAILWAY_ENVIRONMENT_ID` or `RAILWAY_ENVIRONMENT_NAME` is present, so the
+policy does not depend on which Dockerfile built the image. The variable takes
+exactly `true` or `false`; any other value (`1`, `TRUE`, `true `, empty)
+stops the server at startup. Each boot logs `authDisableSignUp` in the
+"Authenticated mode auth origin configuration" line.
+
+Existing users sign in as before. A first Google sign-in links to an existing
+user with the same verified email, so a forgotten password is recovered by
+signing in with Google.
+
+Full lockout, or adding a person. The service has no config.json (measured
+2026-10-07); the CLI reads `PAPERCLIP_DEPLOYMENT_MODE` and `DATABASE_URL` from
+the service environment.
+
+1. In Railway, set the paperclip variable `PAPERCLIP_AUTH_DISABLE_SIGN_UP=false`
+   and deploy.
+2. Open a shell in the running service (`railway ssh --service <paperclip>`)
+   and, from `/app`, create a one-time admin invite:
+   `node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts auth bootstrap-ceo --force --base-url <URL you open Paperclip at>`
+   `--force` is needed because an instance admin already exists. The previous
+   unaccepted bootstrap invite is revoked.
+3. Open the printed `/invite/<token>` URL, create the account, accept the
+   invite. Accepting makes the account an instance admin, which sees and
+   manages every company (no company membership is needed).
+4. Delete the variable (do not set it to anything else) and deploy. Check the
+   boot log shows `authDisableSignUp: true`. Then sign in with the new account.
+
+Invited people cannot register while sign-up is closed; use the same window.
+
 ## wp16-cutover.sh: move run logs onto a Railway volume at /paperclip
 
 `Dockerfile.railway` runs `docker/railway-entrypoint.sh` as root. It creates

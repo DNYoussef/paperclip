@@ -41,10 +41,9 @@ ENV NODE_ENV=production \
   PAPERCLIP_AUTH_DISABLE_SIGN_UP=true
 
 # Sign-up is closed for every provider (email/password and Google); existing
-# users still sign in, and a Google sign-in links to an existing user with the
-# same verified email. Owner recovery or onboarding a new person: set the
-# Railway variable PAPERCLIP_AUTH_DISABLE_SIGN_UP=false (it overrides this ENV),
-# redeploy, create the account, then delete the variable and redeploy.
+# users still sign in. Only an explicit Railway variable
+# PAPERCLIP_AUTH_DISABLE_SIGN_UP=false reopens it. Owner recovery procedure:
+# scripts/railway/README.md, "Sign-up policy and owner recovery".
 
 EXPOSE 3100
 

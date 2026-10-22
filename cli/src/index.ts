@@ -147,7 +147,9 @@ auth
   .option("--force", "Create new invite even if admin already exists", false)
   .option("--expires-hours <hours>", "Invite expiration window in hours", (value) => Number(value))
   .option("--base-url <url>", "Public base URL used to print invite link")
-  .action(bootstrapCeoInvite);
+  .action(async (opts) => {
+    await bootstrapCeoInvite(opts);
+  });
 
 program.parseAsync().catch((err) => {
   console.error(err instanceof Error ? err.message : String(err));

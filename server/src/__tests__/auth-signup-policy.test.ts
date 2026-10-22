@@ -4,9 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { authUsers } from "@paperclipai/db";
-import { createBetterAuthInstance } from "../auth/better-auth.js";
+import request from "supertest";
+import { authUsers, instanceUserRoles } from "@paperclipai/db";
+import { bootstrapCeoInvite } from "../../../cli/src/commands/auth-bootstrap-ceo.js";
+import { createApp } from "../app.js";
+import { createBetterAuthHandler, createBetterAuthInstance, resolveBetterAuthSession } from "../auth/better-auth.js";
 import type { Config } from "../config.js";
+import { seedWorld } from "./helpers/real-app.js";
 import { startTestDb, type TestDb } from "./helpers/test-db.js";
 
 // Railway incident A5: the production image must close sign-up on every path
@@ -31,32 +35,40 @@ let openAuth: Auth;
 let closedAuth: Auth;
 let googleUser = { email: "", sub: "" };
 
-// KEY=VALUE pairs of every ENV instruction in Dockerfile.railway.
-function dockerfileRailwayEnv() {
-  const text = readFileSync(new URL("../../../Dockerfile.railway", import.meta.url), "utf8");
+// PAPERCLIP_* pairs of every ENV instruction in a repo-root Dockerfile. Other
+// keys (NODE_ENV, HOME) would change the test process itself.
+function dockerfileEnv(file: "Dockerfile.railway" | "Dockerfile" = "Dockerfile.railway") {
+  const text = readFileSync(new URL(`../../../${file}`, import.meta.url), "utf8");
   const env: Record<string, string> = {};
   for (const line of text.replace(/\r/g, "").replace(/\\\n/g, " ").split("\n")) {
     if (!line.startsWith("ENV ")) continue;
-    for (const m of line.slice(4).matchAll(/([A-Za-z0-9_]+)=(\S+)/g)) env[m[1]] = m[2];
+    for (const m of line.slice(4).matchAll(/(PAPERCLIP_[A-Za-z0-9_]+)=(\S+)/g)) env[m[1]] = m[2];
   }
   return env;
 }
 
-// Config as the Railway image builds it. Only PAPERCLIP_* variables are
-// applied (NODE_ENV/HOME would change the test process); home and config
-// file point at an empty temp dir, and env beats the config file anyway.
+// Config as an image with this ENV builds it. Home and config file point at
+// an empty temp dir (the Railway service has no config.json); the Railway
+// markers are absent unless an override sets them.
 function configFromEnv(env: Record<string, string>, overrides: Record<string, string | undefined> = {}) {
   const home = mkdtempSync(join(tmpdir(), "paperclip-a5-home-"));
-  const vars = { ...env, PAPERCLIP_HOME: home, PAPERCLIP_CONFIG: join(home, "config.json"), ...overrides };
-  for (const [name, value] of Object.entries(vars)) {
-    if (name.startsWith("PAPERCLIP_")) vi.stubEnv(name, value);
-  }
+  const vars: Record<string, string | undefined> = {
+    RAILWAY_ENVIRONMENT_ID: undefined,
+    RAILWAY_ENVIRONMENT_NAME: undefined,
+    ...env,
+    PAPERCLIP_HOME: home,
+    PAPERCLIP_CONFIG: join(home, "config.json"),
+    ...overrides,
+  };
+  for (const [name, value] of Object.entries(vars)) vi.stubEnv(name, value);
   try {
     return loadConfig();
   } finally {
-    for (const name of Object.keys(vars)) if (name.startsWith("PAPERCLIP_")) vi.stubEnv(name, undefined);
+    for (const name of Object.keys(vars)) vi.stubEnv(name, undefined);
   }
 }
+
+const ON_RAILWAY = { RAILWAY_ENVIRONMENT_ID: "FAKE_TEST_ENVIRONMENT_ID" };
 
 function b64url(value: unknown) {
   return Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -164,9 +176,9 @@ beforeAll(async () => {
   vi.stubEnv("PAPERCLIP_HOME", mkdtempSync(join(tmpdir(), "paperclip-a5-import-")));
   ({ loadConfig } = await import("../config.js"));
   vi.stubEnv("PAPERCLIP_HOME", undefined);
-  productionConfig = configFromEnv(dockerfileRailwayEnv());
+  productionConfig = configFromEnv(dockerfileEnv(), ON_RAILWAY);
   // The documented recovery path: a Railway variable overriding the image ENV.
-  recoveryConfig = configFromEnv(dockerfileRailwayEnv(), { PAPERCLIP_AUTH_DISABLE_SIGN_UP: "false" });
+  recoveryConfig = configFromEnv(dockerfileEnv(), { ...ON_RAILWAY, PAPERCLIP_AUTH_DISABLE_SIGN_UP: "false" });
   testDb = await startTestDb();
   vi.stubGlobal("fetch", fakeGoogleFetch);
   openAuth = makeAuth(recoveryConfig);
@@ -180,13 +192,39 @@ afterAll(async () => {
 });
 
 describe("sign-up policy applies to every provider", { timeout: 60_000 }, () => {
-  it("Dockerfile.railway closes sign-up; without that ENV the code default is open", () => {
-    expect(dockerfileRailwayEnv().PAPERCLIP_AUTH_DISABLE_SIGN_UP).toBe("true");
+  it("Dockerfile.railway closes sign-up; only an explicit false reopens it", () => {
+    expect(dockerfileEnv().PAPERCLIP_AUTH_DISABLE_SIGN_UP).toBe("true");
     expect(productionConfig.authDisableSignUp).toBe(true);
     expect(recoveryConfig.authDisableSignUp).toBe(false);
-    // Control: the same image ENV minus that line leaves registration open.
-    const { PAPERCLIP_AUTH_DISABLE_SIGN_UP: _dropped, ...rest } = dockerfileRailwayEnv();
-    expect(configFromEnv(rest).authDisableSignUp).toBe(false);
+    expect(configFromEnv(dockerfileEnv()).authDisableSignUp).toBe(true);
+    const railwayJson = JSON.parse(readFileSync(new URL("../../../railway.json", import.meta.url), "utf8"));
+    expect(railwayJson.build).toEqual({ builder: "DOCKERFILE", dockerfilePath: "Dockerfile.railway" });
+  });
+
+  it("on Railway sign-up is closed whichever Dockerfile built the image", () => {
+    const { PAPERCLIP_AUTH_DISABLE_SIGN_UP: _dropped, ...withoutLine } = dockerfileEnv();
+    expect(dockerfileEnv("Dockerfile").PAPERCLIP_AUTH_DISABLE_SIGN_UP).toBeUndefined();
+    expect(configFromEnv(dockerfileEnv("Dockerfile"), ON_RAILWAY).authDisableSignUp).toBe(true);
+    expect(configFromEnv(dockerfileEnv("Dockerfile"), { RAILWAY_ENVIRONMENT_NAME: "production" }).authDisableSignUp).toBe(true);
+    expect(configFromEnv(withoutLine, ON_RAILWAY).authDisableSignUp).toBe(true);
+    // Control: off Railway, without the image line, the upstream default (open) holds.
+    expect(configFromEnv(dockerfileEnv("Dockerfile")).authDisableSignUp).toBe(false);
+    expect(configFromEnv(withoutLine).authDisableSignUp).toBe(false);
+  });
+
+  it("PAPERCLIP_AUTH_DISABLE_SIGN_UP accepts only true/false; anything else stops startup", () => {
+    for (const bad of ["1", "0", "TRUE", "True", "true ", " true", "", "yes", "no", "FALSE", "false "]) {
+      for (const where of [ON_RAILWAY, {}]) {
+        expect(
+          () => configFromEnv(dockerfileEnv(), { ...where, PAPERCLIP_AUTH_DISABLE_SIGN_UP: bad }),
+          JSON.stringify(bad),
+        ).toThrow(/PAPERCLIP_AUTH_DISABLE_SIGN_UP/);
+      }
+    }
+    expect(configFromEnv(dockerfileEnv("Dockerfile"), { PAPERCLIP_AUTH_DISABLE_SIGN_UP: "true" }).authDisableSignUp).toBe(true);
+    expect(
+      configFromEnv(dockerfileEnv("Dockerfile"), { ...ON_RAILWAY, PAPERCLIP_AUTH_DISABLE_SIGN_UP: "false" }).authDisableSignUp,
+    ).toBe(false);
   });
 
   it("email/password: production config refuses a new account; the recovery override allows it", async () => {
@@ -276,5 +314,92 @@ describe("Better Auth secret", () => {
       vi.stubEnv("BETTER_AUTH_SECRET", "FAKE_TEST_BETTER_AUTH_SECRET_0123456789abcdef");
       vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", undefined);
     }
+  });
+});
+
+// The real app (every router, real Better Auth) over the test database.
+function appWith(auth: Auth) {
+  return createApp(testDb.db, {
+    uiMode: "none",
+    serverPort: 0,
+    storageService: {} as any,
+    deploymentMode: "authenticated",
+    deploymentExposure: "public",
+    allowedHostnames: [],
+    bindHost: "127.0.0.1",
+    authReady: true,
+    companyDeletionEnabled: false,
+    betterAuthHandler: createBetterAuthHandler(auth),
+    resolveSession: (req) => resolveBetterAuthSession(auth, req),
+  });
+}
+
+function sessionCookie(res: request.Response) {
+  return ([] as string[]).concat(res.headers["set-cookie"] ?? []).map((c) => c.split(";")[0]).join("; ");
+}
+
+describe("owner recovery on an env-only Railway deployment", { timeout: 120_000 }, () => {
+  it("reopen, bootstrap-ceo without config.json, accept, close again: the new account is instance admin", async () => {
+    // The locked-out owner is world.users.admin, an existing instance admin.
+    const world = await seedWorld(testDb.db);
+    const password = "FAKE_TEST_RECOVERY_PASSWORD_123";
+    const email = unique("recovered-owner");
+
+    // 1. Railway variable PAPERCLIP_AUTH_DISABLE_SIGN_UP=false, redeploy.
+    const reopened = await appWith(makeAuth(recoveryConfig));
+
+    // 2. In the service shell: no config.json, env from the image and Railway.
+    const home = mkdtempSync(join(tmpdir(), "paperclip-a5-cli-"));
+    vi.stubEnv("PAPERCLIP_CONFIG", join(home, "config.json"));
+    vi.stubEnv("PAPERCLIP_DEPLOYMENT_MODE", dockerfileEnv().PAPERCLIP_DEPLOYMENT_MODE);
+    vi.stubEnv("DATABASE_URL", testDb.url);
+    let inviteUrl: string | undefined;
+    try {
+      inviteUrl = await bootstrapCeoInvite({ force: true, baseUrl: ORIGIN });
+    } finally {
+      vi.stubEnv("PAPERCLIP_CONFIG", undefined);
+      vi.stubEnv("PAPERCLIP_DEPLOYMENT_MODE", undefined);
+      vi.stubEnv("DATABASE_URL", undefined);
+    }
+    expect(inviteUrl).toMatch(/^http:\/\/localhost:3100\/invite\/pcp_bootstrap_[0-9a-f]+$/);
+    const token = inviteUrl!.split("/invite/")[1];
+
+    // 3. Create the account and accept the invite while sign-up is open.
+    const signUp = await request(reopened)
+      .post("/api/auth/sign-up/email")
+      .set("origin", ORIGIN)
+      .send({ name: "Recovered owner", email, password });
+    expect(signUp.status).toBe(200);
+    const cookie = sessionCookie(signUp);
+    // Control: a fresh account alone has no access to existing companies.
+    const before = await request(reopened).get("/api/companies").set("origin", ORIGIN).set("cookie", cookie);
+    expect(JSON.stringify(before.body)).not.toContain(world.companyA.id);
+
+    const accept = await request(reopened)
+      .post(`/api/invites/${token}/accept`)
+      .set("origin", ORIGIN)
+      .set("cookie", cookie)
+      .send({ requestType: "human" });
+    expect(accept.status).toBe(202);
+    expect(accept.body.bootstrapAccepted).toBe(true);
+    const roles = await testDb.db
+      .select()
+      .from(instanceUserRoles)
+      .where(eq(instanceUserRoles.userId, accept.body.userId));
+    expect(roles.map((r) => r.role)).toContain("instance_admin");
+
+    // 4. Delete the variable, redeploy: closed again, the new admin keeps access.
+    const closed = await appWith(makeAuth(productionConfig));
+    const stranger = await request(closed)
+      .post("/api/auth/sign-up/email")
+      .set("origin", ORIGIN)
+      .send({ name: "x", email: unique("after-close"), password });
+    expect(stranger.status).toBeGreaterThanOrEqual(400);
+    const signIn = await request(closed).post("/api/auth/sign-in/email").set("origin", ORIGIN).send({ email, password });
+    expect(signIn.status).toBe(200);
+    const after = await request(closed).get("/api/companies").set("origin", ORIGIN).set("cookie", sessionCookie(signIn));
+    expect(after.status).toBe(200);
+    expect(JSON.stringify(after.body)).toContain(world.companyA.id);
+    expect(JSON.stringify(after.body)).toContain(world.companyB.id);
   });
 });
