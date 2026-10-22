@@ -1,64 +1,66 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { APIError } from "better-auth/api";
-import { eq, sql } from "drizzle-orm";
-import { authVerifications, type Db } from "@paperclipai/db";
+import { sql } from "drizzle-orm";
+import { authAccounts, authSessions, type Db } from "@paperclipai/db";
 
-// Credential epoch: one integer row that operator recovery bumps, checked by
-// the database at the moment Better Auth writes a session or an account.
+// Credential epoch: one integer row that operator recovery increments in the
+// same transaction that replaces a user's credentials. Every Better Auth
+// session or account write is made conditional on it, in its own
+// transaction, so a stale write is never committed.
 //
-// Recovery: (1) bump to an odd value and commit ("recovery in progress"),
-// (2) replace the user's credentials and delete their sessions, commit,
-// (3) compare-and-set to the next even value. Every auth HTTP request reads
-// the epoch when it enters, before Better Auth reads any credential. A
-// session or account write is refused, and if already written is deleted,
-// unless the epoch is even and still equal to that entry value.
+// Recovery (one transaction): lock the epoch row FOR UPDATE, delete the
+// user's accounts and sessions, insert the fresh credential, grant admin,
+// increment the epoch, commit. A second recovery waits on that row lock, so
+// recoveries are serialized and each commits completely or not at all.
 //
-// So a request that verified a credential before (2) committed cannot keep
-// what it writes afterwards: a write committed before (1) is deleted by (2);
-// a write checked after (1) sees an odd or a changed epoch. Each check is a
-// single committed statement with no session state, so it holds through
-// connection loss and transaction-mode pooling, and no server has to stop.
-// If the tool dies between (1) and (3) the epoch stays odd and every login is
-// refused until the tool runs again (fail closed).
+// Request: the wrapped handler reads the epoch on entry, before Better Auth
+// reads any credential. A session/account insert or account update then
+// runs as: begin; lock the epoch row FOR SHARE (waits for a recovery in
+// progress); refuse unless it still equals the entry value; write; commit.
+// So a request that verified a credential older than the last committed
+// recovery is refused before anything becomes visible, and a recovery that
+// starts after such a write took its share lock waits for the write to
+// commit and then deletes it. All of it is transaction-scoped: nothing
+// depends on a connection staying open or on session-level state, so
+// connection loss and transaction-mode pooling do not matter.
 //
 // Storage: a fixed row in Better Auth's own verification table (no schema
-// change). Its expiry is far in the future so expiry cleanup never removes it.
+// change); expiry far in the future so expiry cleanup never removes it.
 const EPOCH_ID = "paperclip-credential-epoch";
 const FAR_FUTURE = "9999-12-31T00:00:00Z";
 
-type Store = { epoch: number; pendingPassword?: string };
-const requestEpoch = new AsyncLocalStorage<Store>();
+const requestEpoch = new AsyncLocalStorage<{ epoch: number }>();
 
-export async function readCredentialEpoch(db: Db): Promise<number> {
-  const [row] = await db
-    .select({ value: authVerifications.value })
-    .from(authVerifications)
-    .where(eq(authVerifications.id, EPOCH_ID));
-  return row ? Number(row.value) : 0;
-}
+type Tx = Pick<Db, "execute">;
 
-// Step (1). Always lands on an odd value, also after an interrupted run.
-export async function beginCredentialRecovery(db: Db): Promise<number> {
-  const rows = (await db.execute(sql`
+async function lockEpoch(tx: Tx, mode: "share" | "update"): Promise<number> {
+  await tx.execute(sql`
     insert into verification (id, identifier, value, expires_at, created_at, updated_at)
-    values (${EPOCH_ID}, ${EPOCH_ID}, '1', ${FAR_FUTURE}::timestamptz, now(), now())
-    on conflict (id) do update
-      set value = (verification.value::bigint + case when verification.value::bigint % 2 = 0 then 1 else 2 end)::text,
-          updated_at = now()
-    returning value
-  `)) as unknown as Array<{ value: string }>;
+    values (${EPOCH_ID}, ${EPOCH_ID}, '0', ${FAR_FUTURE}::timestamptz, now(), now())
+    on conflict (id) do nothing
+  `);
+  const rows = (await tx.execute(
+    mode === "share"
+      ? sql`select value from verification where id = ${EPOCH_ID} for share`
+      : sql`select value from verification where id = ${EPOCH_ID} for update`,
+  )) as unknown as Array<{ value: string }>;
   return Number(rows[0]!.value);
 }
 
-// Step (3). Returns false if another recovery moved the epoch meanwhile; the
-// epoch then stays odd until that run ends.
-export async function endCredentialRecovery(db: Db, odd: number): Promise<boolean> {
-  const rows = await db
-    .update(authVerifications)
-    .set({ value: String(odd + 1), updatedAt: new Date() })
-    .where(sql`${authVerifications.id} = ${EPOCH_ID} and ${authVerifications.value} = ${String(odd)}`)
-    .returning();
-  return rows.length === 1;
+export async function readCredentialEpoch(db: Tx): Promise<number> {
+  const rows = (await db.execute(
+    sql`select value from verification where id = ${EPOCH_ID}`,
+  )) as unknown as Array<{ value: string }>;
+  return rows[0] ? Number(rows[0].value) : 0;
+}
+
+// For recover-admin: call first inside its transaction; returns a function
+// to call last, which increments the epoch.
+export async function lockEpochForRecovery(tx: Tx) {
+  const epoch = await lockEpoch(tx, "update");
+  return async () => {
+    await tx.execute(sql`update verification set value = ${String(epoch + 1)}, updated_at = now() where id = ${EPOCH_ID}`);
+  };
 }
 
 // Wrap Better Auth's request handler: every request carries its entry epoch.
@@ -69,21 +71,57 @@ export function withEntryEpoch<T>(db: Db, handler: (request: Request) => Promise
   };
 }
 
-export function rememberPendingPassword(password: unknown) {
-  const store = requestEpoch.getStore();
-  if (store && typeof password === "string") store.pendingPassword = password;
+function refused() {
+  return new APIError("UNAUTHORIZED", { message: "Credentials changed while signing in; try again" });
 }
 
-export function pendingPassword() {
-  return requestEpoch.getStore()?.pendingPassword;
+async function conditionalWrite<T>(db: Db, write: (tx: Db) => Promise<T>): Promise<T> {
+  const store = requestEpoch.getStore();
+  // Writes outside a handler request have no entry epoch: refused.
+  if (!store) throw refused();
+  return db.transaction(async (tx) => {
+    if ((await lockEpoch(tx, "share")) !== store.epoch) throw refused();
+    return write(tx as unknown as Db);
+  });
 }
 
-// Throws unless this request may write credentials or sessions now. Writes
-// outside a handler request (no entry epoch) are refused.
-export async function assertCredentialWriteAllowed(db: Db) {
-  const store = requestEpoch.getStore();
-  const now = await readCredentialEpoch(db);
-  if (!store || now % 2 === 1 || now !== store.epoch) {
-    throw new APIError("UNAUTHORIZED", { message: "Credentials changed while signing in; try again" });
-  }
+// The database handle given to Better Auth's drizzle adapter. Inserts into
+// session and account, and updates of account, go through conditionalWrite;
+// everything else passes through. The adapter issues
+// insert(table).values(v).returning(), update(table).set(v).where(c).returning()
+// and, for updateMany, await update(table).set(v).where(c).
+export function withConditionalCredentialWrites(db: Db): Db {
+  return new Proxy(db as any, {
+    get(target, prop) {
+      if (prop === "insert") {
+        return (table: unknown) => {
+          if (table !== authSessions && table !== authAccounts) return target.insert(table);
+          return {
+            values: (values: unknown) => ({
+              returning: () => conditionalWrite(target, (tx: any) => tx.insert(table).values(values).returning()),
+            }),
+          };
+        };
+      }
+      if (prop === "update") {
+        return (table: unknown) => {
+          if (table !== authAccounts) return target.update(table);
+          return {
+            set: (values: unknown) => ({
+              where: (...clause: unknown[]) => {
+                const run = (finish: (b: any) => Promise<unknown>) =>
+                  conditionalWrite(target, (tx: any) => finish(tx.update(table).set(values).where(...clause)));
+                return {
+                  then: (ok: any, bad: any) => run(async (b) => b).then(ok, bad),
+                  returning: () => run((b) => b.returning()),
+                };
+              },
+            }),
+          };
+        };
+      }
+      const value = target[prop];
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as Db;
 }

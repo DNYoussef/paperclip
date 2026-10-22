@@ -16,13 +16,14 @@ user with the same verified email, so a forgotten password is recovered by
 signing in with Google.
 
 Owner recovery (full lockout, or a new instance admin) never reopens sign-up
-and does not need the service stopped. It moves a credential epoch
-(`server/src/auth/credential-epoch.ts`): every auth request records the epoch
-when it enters, and the server refuses, or deletes again, any session or
-account it writes unless the epoch is unchanged and no recovery is in
-progress. So a login, password change or Google link that was already in
-flight when recovery ran keeps nothing. While the tool runs, all logins fail
-for a moment; retry.
+and does not need the service stopped. It runs as one database transaction
+that holds and increments a credential epoch
+(`server/src/auth/credential-epoch.ts`). Every auth request records the epoch
+when it enters, and every session or account write the server makes is
+conditional on it inside its own transaction, so a login, password change or
+Google link that was already in flight when recovery ran is refused before
+anything it writes becomes visible. Recoveries are serialized by the same
+lock. Logins in flight at that moment fail and can be retried.
 
 1. `railway ssh --service <paperclip>`, then from `/app`:
    `node --import ./server/node_modules/tsx/dist/loader.mjs server/src/auth/recover-admin.ts <email>`
@@ -37,8 +38,8 @@ for a moment; retry.
 3. Sign in with the email and the printed password. To rotate it, run the
    tool again.
 
-If the tool is interrupted, every login is refused until it runs again (it
-fails closed); just run it again.
+If the tool is interrupted, its transaction rolls back and nothing changes;
+run it again.
 
 Do not reopen sign-up to recover. `PAPERCLIP_AUTH_DISABLE_SIGN_UP=false` opens
 registration to anyone who can reach the server, for any email: an attacker

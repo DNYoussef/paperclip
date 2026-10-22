@@ -474,27 +474,40 @@ function runRecoverAdminAsync(email: string) {
   });
 }
 
-// A real Better Auth instance over the real database, except that one kind of
-// write (insert or update on one table) waits on a gate: the request has done
-// its checks (password verified, provider identity resolved) and the write is
-// not yet issued. The rest of the database is untouched and pooled as usual;
-// no server lease or session-level lock exists.
-function pausedWrite(config: Config, pause: { insert?: unknown; update?: unknown }) {
+// A real Better Auth instance over the real database, except that the request
+// stops right before its first credential or session write: at the first
+// transaction it opens, or at a plain insert/update on the given table,
+// whichever comes first. The request has done its checks (password verified,
+// provider identity resolved); nothing is written yet. `failDelete` makes the
+// server's deletes on that table fail, as a lost database connection would.
+function pausedWrite(config: Config, pause: { insert?: unknown; update?: unknown; failDelete?: unknown }) {
   let resume!: () => void;
   const gate = new Promise<void>((r) => (resume = r));
   let reached!: () => void;
   const paused = new Promise<void>((r) => (reached = r));
+  let armed = true;
+  const stop = async () => {
+    if (!armed) return;
+    armed = false;
+    reached();
+    await gate;
+  };
   const real = testDb.db as any;
   const db = new Proxy(real, {
     get(target, prop) {
+      if (prop === "transaction") {
+        return async (fn: unknown, ...rest: unknown[]) => {
+          await stop();
+          return target.transaction(fn, ...rest);
+        };
+      }
       if (prop === "insert") {
         return (table: unknown) => {
           if (table !== pause.insert) return target.insert(table);
           return {
             values: (values: unknown) => ({
               returning: async () => {
-                reached();
-                await gate;
+                await stop();
                 return target.insert(table).values(values).returning();
               },
             }),
@@ -508,8 +521,7 @@ function pausedWrite(config: Config, pause: { insert?: unknown; update?: unknown
             set: (values: unknown) => ({
               where: (...clause: unknown[]) => {
                 const run = async (finish: (b: any) => unknown) => {
-                  reached();
-                  await gate;
+                  await stop();
                   return finish(target.update(table).set(values).where(...clause));
                 };
                 return {
@@ -521,12 +533,84 @@ function pausedWrite(config: Config, pause: { insert?: unknown; update?: unknown
           };
         };
       }
+      if (prop === "delete" && pause.failDelete) {
+        return (table: unknown) => {
+          if (table === pause.failDelete) throw new Error("simulated database loss during cleanup");
+          return target.delete(table);
+        };
+      }
       const value = target[prop];
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
   const auth = createBetterAuthInstance(db, { ...config, authBaseUrlMode: "explicit", authPublicBaseUrl: ORIGIN });
   return { auth, paused, resume };
+}
+
+// recoverInstanceAdmin in this process, stopped inside its credential
+// transaction (at its first delete), so another recovery or a login can run
+// while it is open.
+async function pausedRecovery(email: string) {
+  const { recoverInstanceAdmin } = await import("../auth/recover-admin.js");
+  let resume!: () => void;
+  const gate = new Promise<void>((r) => (resume = r));
+  let reached!: () => void;
+  const paused = new Promise<void>((r) => (reached = r));
+  let armed = true;
+  const real = testDb.db as any;
+  const db = new Proxy(real, {
+    get(target, prop) {
+      if (prop === "transaction") {
+        return (fn: (tx: any) => unknown, ...rest: unknown[]) =>
+          target.transaction(
+            (tx: any) =>
+              fn(
+                new Proxy(tx, {
+                  get(t, q) {
+                    if (q === "delete" && armed) {
+                      return (table: unknown) => {
+                        const builder = t.delete(table);
+                        return {
+                          where: (...c: unknown[]) => ({
+                            returning: async () => {
+                              armed = false;
+                              reached();
+                              await gate;
+                              return builder.where(...c).returning();
+                            },
+                          }),
+                        };
+                      };
+                    }
+                    const v = t[q];
+                    return typeof v === "function" ? v.bind(t) : v;
+                  },
+                }),
+              ),
+            ...rest,
+          );
+      }
+      const value = target[prop];
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const done = recoverInstanceAdmin(db, email);
+  return { done, paused, resume };
+}
+
+async function lockWaiters() {
+  const rows = (await testDb.db.execute(
+    sql`select count(*)::int as n from pg_stat_activity where wait_event_type = 'Lock' and datname = current_database()`,
+  )) as unknown as Array<{ n: number }>;
+  return rows[0]?.n ?? 0;
+}
+
+async function waitFor(cond: () => Promise<boolean>, ms = 30_000) {
+  const deadline = Date.now() + ms;
+  while (!(await cond())) {
+    if (Date.now() > deadline) throw new Error("condition not reached");
+    await new Promise((r) => setTimeout(r, 100));
+  }
 }
 
 async function plantAttacker(email: string, password: string) {
@@ -592,11 +676,8 @@ describe("owner recovery is safe against in-flight authentication (no server lea
     expect(await changed.clone().text()).toMatch(/Credentials changed/);
     expect(await signInStatus(email, "FAKE_TEST_ATTACKER_NEW_PW_1")).toBeGreaterThanOrEqual(400);
     expect(await signInStatus(email, attackerPassword)).toBeGreaterThanOrEqual(400);
-    // Fail closed: if the late write touched the recovered credential it is
-    // removed, and a second recovery restores access.
-    const rerun = await runRecoverAdminAsync(email);
-    expect(rerun.code, rerun.out).toBe(0);
-    expect(await signInStatus(email, rerun.password!)).toBe(200);
+    // The recovered credential was never touched.
+    expect(await signInStatus(email, recovery.password!)).toBe(200);
   });
 
   it("a Google link paused before its write is not left behind and yields no session", async () => {
@@ -619,18 +700,127 @@ describe("owner recovery is safe against in-flight authentication (no server lea
     expect(await signInStatus(email, recovery.password!)).toBe(200);
   });
 
-  it("an interrupted recovery leaves every login refused until the tool runs again", async () => {
-    const email = unique("interrupted");
+  it("overlapping recoveries: a login verified before the last recovery commits gets no session", async () => {
+    const email = unique("overlap");
+    const attackerPassword = "FAKE_TEST_ATTACKER_PASSWORD_321";
+    await plantAttacker(email, attackerPassword);
+
+    // Recovery A is open (inside its credential transaction).
+    const a = await pausedRecovery(email);
+    await a.paused;
+    // Recovery B starts; it may finish (no serialization) or wait for A.
+    const b = runRecoverAdminAsync(email);
+    let bDone = false;
+    void b.then(() => (bDone = true));
+    await waitFor(async () => bDone || (await lockWaiters()) > 0);
+    const bEarly = bDone ? await b : null;
+    // A login verifies whatever credential is current now, then stops
+    // right before writing its session.
+    const current = bEarly ? bEarly.password! : attackerPassword;
+    const server = pausedWrite(productionConfig, { insert: authSessions });
+    const login = call(server.auth, "POST", "/sign-in/email", { body: { email, password: current } });
+    await Promise.race([server.paused, login]);
+    // A commits, then B (if it was waiting) commits.
+    a.resume();
+    const aResult = await a.done;
+    const bResult = await b;
+    expect(bResult.code, bResult.out).toBe(0);
+    server.resume();
+    const resumed = await login;
+
+    expect(resumed.status).toBeGreaterThanOrEqual(400);
+    expect(await sessionOf(cookiesOf(resumed))).toBeNull();
+    expect(await signInStatus(email, attackerPassword)).toBeGreaterThanOrEqual(400);
+    // Exactly one recovery's password is the live one: whichever committed last.
+    const live = [aResult.password, bResult.password!].map(async (pw) => (await signInStatus(email, pw)) === 200);
+    expect((await Promise.all(live)).filter(Boolean)).toHaveLength(1);
+  });
+
+  it("a stale Google link never becomes visible, even if cleanup could not run", async () => {
+    const email = unique("gl-stale");
+    await plantAttacker(email, "FAKE_TEST_ATTACKER_PASSWORD_111");
+    const sub = `sub-${randomUUID()}`;
+
+    const server = pausedWrite(productionConfig, { insert: authAccounts, failDelete: authAccounts });
+    const link = googleRedirectSignIn(server.auth, email, sub);
+    await server.paused;
+    const recovery = await runRecoverAdminAsync(email);
+    expect(recovery.code, recovery.out).toBe(0);
+    server.resume();
+    const linked = await link;
+    expect(await sessionOf(cookiesOf(linked))).toBeNull();
+
+    // A second login with the same Google subject but another email works
+    // only through a linked row; there must be none.
+    const second = await googleRedirectSignIn(closedAuth, unique("other-mail"), sub);
+    expect(second.headers.get("location")).toMatch(/error=/);
+    expect(await sessionOf(cookiesOf(second))).toBeNull();
+    const [user] = await testDb.db.select().from(authUsers).where(eq(authUsers.email, email));
+    const accounts = await testDb.db.select().from(authAccounts).where(eq(authAccounts.userId, user!.id));
+    expect(accounts.map((x) => x.providerId)).toEqual(["credential"]);
+  });
+
+  it("a recovery waits for a credential write that already holds the epoch, then removes it", async () => {
+    const email = unique("waits");
+    const owner = await runRecoverAdminAsync(email);
+    expect(owner.code, owner.out).toBe(0);
+    // A login that is mid-write: its transaction holds the epoch row FOR SHARE.
+    let release!: () => void;
+    const hold = new Promise<void>((r) => (release = r));
+    let held!: () => void;
+    const isHeld = new Promise<void>((r) => (held = r));
+    const writer = testDb.db.transaction(async (tx) => {
+      await tx.execute(sql`select value from verification where id = 'paperclip-credential-epoch' for share`);
+      held();
+      await hold;
+    });
+    await isHeld;
+    let finished = false;
+    const recovery = runRecoverAdminAsync(email).then((r) => ((finished = true), r));
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(finished).toBe(false);
+    release();
+    await writer;
+    const r = await recovery;
+    expect(r.code, r.out).toBe(0);
+    expect(await signInStatus(email, r.password!)).toBe(200);
+  });
+
+  it("a recovery that fails part-way changes nothing and blocks no one", async () => {
+    const email = unique("partial");
     const first = await runRecoverAdminAsync(email);
     expect(first.code, first.out).toBe(0);
+    const { readCredentialEpoch } = await import("../auth/credential-epoch.js");
+    const { recoverInstanceAdmin } = await import("../auth/recover-admin.js");
+    const before = await readCredentialEpoch(testDb.db);
+    // The process dies after deleting the old credentials, before commit.
+    const crashing = new Proxy(testDb.db as any, {
+      get(target, prop) {
+        if (prop === "transaction") {
+          return (fn: (tx: any) => unknown) =>
+            target.transaction((tx: any) =>
+              fn(
+                new Proxy(tx, {
+                  get(t, q) {
+                    if (q === "insert") {
+                      return (table: unknown) => {
+                        if (table === authAccounts) throw new Error("simulated crash");
+                        return t.insert(table);
+                      };
+                    }
+                    const v = t[q];
+                    return typeof v === "function" ? v.bind(t) : v;
+                  },
+                }),
+              ),
+            );
+        }
+        const v = target[prop];
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    await expect(recoverInstanceAdmin(crashing, email)).rejects.toThrow(/simulated crash/);
+    expect(await readCredentialEpoch(testDb.db)).toBe(before);
     expect(await signInStatus(email, first.password!)).toBe(200);
-
-    const { beginCredentialRecovery } = await import("../auth/credential-epoch.js");
-    await beginCredentialRecovery(testDb.db); // the tool died after this step
-    expect(await signInStatus(email, first.password!)).toBeGreaterThanOrEqual(400);
-
-    const rerun = await runRecoverAdminAsync(email);
-    expect(rerun.code, rerun.out).toBe(0);
-    expect(await signInStatus(email, rerun.password!)).toBe(200);
   });
 });
