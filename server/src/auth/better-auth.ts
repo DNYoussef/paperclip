@@ -1,7 +1,7 @@
 import type { Request, RequestHandler } from "express";
 import type { IncomingHttpHeaders } from "node:http";
 import { betterAuth } from "better-auth";
-import { createAuthMiddleware } from "better-auth/api";
+import { APIError, createAuthMiddleware } from "better-auth/api";
 import { and, eq, ne } from "drizzle-orm";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { toNodeHandler } from "better-auth/node";
@@ -70,7 +70,13 @@ export function deriveAuthTrustedOrigins(config: Config): string[] {
 
 export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins?: string[]): BetterAuthInstance {
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
-  const secret = process.env.BETTER_AUTH_SECRET ?? process.env.PAPERCLIP_AGENT_JWT_SECRET ?? "paperclip-dev-secret";
+  // Defense in depth: index.ts already refuses to start authenticated mode
+  // without a secret; this keeps any other caller from signing sessions with
+  // a well-known key.
+  const secret = process.env.BETTER_AUTH_SECRET ?? process.env.PAPERCLIP_AGENT_JWT_SECRET;
+  if (!secret?.trim()) {
+    throw new Error("Better Auth requires BETTER_AUTH_SECRET (or PAPERCLIP_AGENT_JWT_SECRET) to be set");
+  }
   const effectiveTrustedOrigins = trustedOrigins ?? deriveAuthTrustedOrigins(config);
 
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL ?? baseUrl;
@@ -95,6 +101,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins?
             google: {
               clientId: process.env.GOOGLE_CLIENT_ID,
               clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+              disableSignUp: config.authDisableSignUp,
             },
           },
         }
@@ -139,6 +146,21 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins?
       }),
     },
     databaseHooks: {
+      // Sign-up policy for every provider and path. The per-provider flags
+      // above are not enough: better-auth 1.4.18 id-token sign-in
+      // (POST /sign-in/social with idToken) reads provider.disableSignUp,
+      // which the Google provider never sets, so it would create the user.
+      // Existing users are untouched (OAuth linking creates an account row,
+      // not a user row).
+      user: {
+        create: {
+          before: async () => {
+            if (config.authDisableSignUp) {
+              throw new APIError("FORBIDDEN", { message: "Sign-up is disabled" });
+            }
+          },
+        },
+      },
       session: {
         delete: {
           after: async (session: { id: string }) => {

@@ -42,6 +42,8 @@ const AUTH_ORIGIN = "http://localhost:3100";
 
 beforeAll(async () => {
   real = await startRealApp();
+  // Better Auth no longer falls back to a built-in secret.
+  vi.stubEnv("BETTER_AUTH_SECRET", "FAKE_TEST_BETTER_AUTH_SECRET_0123456789abcdef");
   auth = createBetterAuthInstance(real.db, {
     authBaseUrlMode: "explicit",
     authPublicBaseUrl: AUTH_ORIGIN,

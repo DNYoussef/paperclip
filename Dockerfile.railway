@@ -37,7 +37,14 @@ ENV NODE_ENV=production \
   PAPERCLIP_INSTANCE_ID=default \
   PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
   PAPERCLIP_DEPLOYMENT_MODE=authenticated \
-  PAPERCLIP_DEPLOYMENT_EXPOSURE=private
+  PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
+  PAPERCLIP_AUTH_DISABLE_SIGN_UP=true
+
+# Sign-up is closed for every provider (email/password and Google); existing
+# users still sign in, and a Google sign-in links to an existing user with the
+# same verified email. Owner recovery or onboarding a new person: set the
+# Railway variable PAPERCLIP_AUTH_DISABLE_SIGN_UP=false (it overrides this ENV),
+# redeploy, create the account, then delete the variable and redeploy.
 
 EXPOSE 3100
 
