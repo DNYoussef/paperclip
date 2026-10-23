@@ -760,29 +760,83 @@ describe("owner recovery is safe against in-flight authentication (no server lea
     expect(accounts.map((x) => x.providerId)).toEqual(["credential"]);
   });
 
-  it("a recovery waits for a credential write that already holds the epoch, then removes it", async () => {
-    const email = unique("waits");
+  it("a real wrapped session write paused after its epoch check holds recovery off; recovery then removes it", async () => {
+    const email = unique("wrapped");
     const owner = await runRecoverAdminAsync(email);
     expect(owner.code, owner.out).toBe(0);
-    // A login that is mid-write: its transaction holds the epoch row FOR SHARE.
-    let release!: () => void;
-    const hold = new Promise<void>((r) => (release = r));
-    let held!: () => void;
-    const isHeld = new Promise<void>((r) => (held = r));
-    const writer = testDb.db.transaction(async (tx) => {
-      await tx.execute(sql`select value from verification where id = 'paperclip-credential-epoch' for share`);
-      held();
-      await hold;
+
+    // Better Auth over the real wrapper (withConditionalCredentialWrites),
+    // stopped INSIDE the wrapper's transaction: after it locked and compared
+    // the epoch, before its session INSERT and commit.
+    let resume!: () => void;
+    const gate = new Promise<void>((r) => (resume = r));
+    let reached!: () => void;
+    const paused = new Promise<void>((r) => (reached = r));
+    let armed = true;
+    const real = testDb.db as any;
+    const db = new Proxy(real, {
+      get(target, prop) {
+        if (prop === "transaction") {
+          return (fn: (tx: any) => unknown, ...rest: unknown[]) =>
+            target.transaction(
+              (tx: any) =>
+                fn(
+                  new Proxy(tx, {
+                    get(t, q) {
+                      if (q === "insert") {
+                        return (table: unknown) => {
+                          if (table !== authSessions || !armed) return t.insert(table);
+                          return {
+                            values: (values: unknown) => ({
+                              returning: async () => {
+                                armed = false;
+                                reached();
+                                await gate;
+                                return t.insert(table).values(values).returning();
+                              },
+                            }),
+                          };
+                        };
+                      }
+                      const v = t[q];
+                      return typeof v === "function" ? v.bind(t) : v;
+                    },
+                  }),
+                ),
+              ...rest,
+            );
+        }
+        const value = target[prop];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
     });
-    await isHeld;
-    let finished = false;
-    const recovery = runRecoverAdminAsync(email).then((r) => ((finished = true), r));
-    await new Promise((r) => setTimeout(r, 1500));
-    expect(finished).toBe(false);
-    release();
-    await writer;
+    const server = createBetterAuthInstance(db, { ...productionConfig, authBaseUrlMode: "explicit", authPublicBaseUrl: ORIGIN });
+    const login = server.handler(
+      new Request(`${ORIGIN}/api/auth/sign-in/email`, {
+        method: "POST",
+        headers: { origin: ORIGIN, "content-type": "application/json" },
+        body: JSON.stringify({ email, password: owner.password }),
+      }),
+    );
+    await Promise.race([paused, login]);
+
+    // Recovery must wait for the open write (it needs the epoch row).
+    let recovered = false;
+    const recovery = runRecoverAdminAsync(email).then((r) => ((recovered = true), r));
+    try {
+      await waitFor(async () => recovered || (await lockWaiters()) > 0);
+      expect(recovered, "recovery finished while a checked write was still open").toBe(false);
+    } finally {
+      resume(); // never leave the write's transaction open
+    }
+
+    // The write commits; only then can recovery run, and it removes it.
+    const loggedIn = await login;
+    expect(loggedIn.status).toBe(200);
     const r = await recovery;
     expect(r.code, r.out).toBe(0);
+    expect(await sessionOf(cookiesOf(loggedIn))).toBeNull();
+    expect(await signInStatus(email, owner.password!)).toBeGreaterThanOrEqual(400);
     expect(await signInStatus(email, r.password!)).toBe(200);
   });
 
