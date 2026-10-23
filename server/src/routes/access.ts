@@ -9,11 +9,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Router } from "express";
 import type { Request } from "express";
-import { and, eq, isNull, desc } from "drizzle-orm";
+import { and, eq, gt, isNull, desc } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentApiKeys,
   authUsers,
+  instanceUserRoles,
   invites,
   joinRequests
 } from "@paperclipai/db";
@@ -1847,16 +1848,29 @@ export function accessRoutes(
           );
         }
         const userId = req.actor.userId ?? "local-board";
-        const existingAdmin = await access.isInstanceAdmin(userId);
-        if (!existingAdmin) {
-          await access.promoteInstanceAdmin(userId);
-        }
-        const updatedInvite = await db
-          .update(invites)
-          .set({ acceptedAt: new Date(), updatedAt: new Date() })
-          .where(eq(invites.id, invite.id))
-          .returning()
-          .then((rows) => rows[0] ?? invite);
+        // Claim and grant in one transaction: the conditional UPDATE takes
+        // the row lock and re-checks state, so a concurrent acceptance or a
+        // revocation that committed after the read above wins cleanly.
+        const updatedInvite = await db.transaction(async (tx) => {
+          const now = new Date();
+          const claimed = await tx
+            .update(invites)
+            .set({ acceptedAt: now, updatedAt: now })
+            .where(
+              and(
+                eq(invites.id, invite.id),
+                isNull(invites.acceptedAt),
+                isNull(invites.revokedAt),
+                gt(invites.expiresAt, now),
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (!claimed) return null;
+          await tx.insert(instanceUserRoles).values({ userId, role: "instance_admin" }).onConflictDoNothing();
+          return claimed;
+        });
+        if (!updatedInvite) throw notFound("Invite not found");
         res.status(202).json({
           inviteId: updatedInvite.id,
           inviteType: updatedInvite.inviteType,

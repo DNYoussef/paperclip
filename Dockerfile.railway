@@ -37,7 +37,14 @@ ENV NODE_ENV=production \
   PAPERCLIP_INSTANCE_ID=default \
   PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
   PAPERCLIP_DEPLOYMENT_MODE=authenticated \
-  PAPERCLIP_DEPLOYMENT_EXPOSURE=private
+  PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
+  PAPERCLIP_AUTH_DISABLE_SIGN_UP=true
+
+# Sign-up is closed for every provider (email/password and Google); existing
+# users still sign in. Only an explicit Railway variable
+# PAPERCLIP_AUTH_DISABLE_SIGN_UP=false reopens it, and that is NOT a recovery
+# step (anyone could register an admin's email). Owner recovery runs from the
+# service shell: scripts/railway/README.md, "Sign-up policy and owner recovery".
 
 EXPOSE 3100
 

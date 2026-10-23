@@ -63,6 +63,22 @@ export interface Config {
   companyDeletionEnabled: boolean;
 }
 
+// PAPERCLIP_AUTH_DISABLE_SIGN_UP accepts exactly "true" or "false". Any other
+// value ("", "1", "TRUE", "true ") stops startup, so a typo can never reopen
+// sign-up. Unset on Railway (RAILWAY_ENVIRONMENT_ID or RAILWAY_ENVIRONMENT_NAME
+// present, whichever Dockerfile built the image): closed, and only an
+// explicit "false" reopens it. Unset elsewhere: the config file value.
+export function resolveAuthDisableSignUp(env: NodeJS.ProcessEnv, fileValue: boolean | undefined): boolean {
+  const raw = env.PAPERCLIP_AUTH_DISABLE_SIGN_UP;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  if (raw !== undefined) {
+    throw new Error(`PAPERCLIP_AUTH_DISABLE_SIGN_UP must be "true" or "false", got ${JSON.stringify(raw)}`);
+  }
+  if (env.RAILWAY_ENVIRONMENT_ID !== undefined || env.RAILWAY_ENVIRONMENT_NAME !== undefined) return true;
+  return fileValue ?? false;
+}
+
 export function loadConfig(): Config {
   const fileConfig = readConfigFile();
   const fileDatabaseMode =
@@ -143,11 +159,7 @@ export function loadConfig(): Config {
     authBaseUrlModeFromEnv ??
     fileConfig?.auth?.baseUrlMode ??
     (authPublicBaseUrl ? "explicit" : "auto");
-  const disableSignUpFromEnv = process.env.PAPERCLIP_AUTH_DISABLE_SIGN_UP;
-  const authDisableSignUp: boolean =
-    disableSignUpFromEnv !== undefined
-      ? disableSignUpFromEnv === "true"
-      : (fileConfig?.auth?.disableSignUp ?? false);
+  const authDisableSignUp = resolveAuthDisableSignUp(process.env, fileConfig?.auth?.disableSignUp);
   const allowedHostnamesFromEnvRaw = process.env.PAPERCLIP_ALLOWED_HOSTNAMES;
   const allowedHostnamesFromEnv = allowedHostnamesFromEnvRaw
     ? allowedHostnamesFromEnvRaw
